@@ -1,0 +1,37 @@
+# Data, Logs & Results
+data
+logs
+results/
+*.log
+KOCO-bench-en/domain_code_generation/scripts/koco_openhands/run_logs/
+KOCO-bench-en/domain_code_generation/scripts/koco_openhands/memory/derived/
+
+# Environment variables
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+.claude/
+.gstack/
