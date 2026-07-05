@@ -14,9 +14,9 @@ PRAXIS has four stages:
 From a fresh clone:
 
 ```bash
-cd kocobench-dev
+cd PRAXIS
 export REPO_ROOT="$PWD"
-export OPENHANDS_DIR="$REPO_ROOT/KOCO-bench-en/domain_code_generation/scripts/koco_openhands"
+export OPENHANDS_DIR="$REPO_ROOT/praxis/domain_code_generation/scripts/koco_openhands"
 cd "$OPENHANDS_DIR"
 
 uv sync
@@ -176,12 +176,12 @@ cli.py run --graph-knowledge-artifact optimized
 It produces:
 
 ```text
-KOCO-bench-en/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_output.jsonl
-KOCO-bench-en/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_result.jsonl
-KOCO-bench-en/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_result.metrics.json
-KOCO-bench-en/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/agent_logs/{example}/{function}/task_prompt.txt
-KOCO-bench-en/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/agent_logs/{example}/{function}/sdk_events.json
-KOCO-bench-en/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/agent_logs/{example}/{function}/tool_trace.jsonl
+praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_output.jsonl
+praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_result.jsonl
+praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_result.metrics.json
+praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/agent_logs/{example}/{function}/task_prompt.txt
+praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/agent_logs/{example}/{function}/sdk_events.json
+praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/agent_logs/{example}/{function}/tool_trace.jsonl
 ```
 
 ## Optional: Online Knowledge Evolution
@@ -201,9 +201,9 @@ export PRAXIS_EVOLVED_PROFILE="${PROFILE}_online"
 This loop reads:
 
 ```text
-KOCO-bench-en/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_output.jsonl
-KOCO-bench-en/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_result.jsonl
-KOCO-bench-en/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/agent_logs/{example}/{function}/
+praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_output.jsonl
+praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_result.jsonl
+praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/agent_logs/{example}/{function}/
 memory/derived/graph_knowledge/{profile}/{framework}/{example}/dep_graph.with_knowledge.optimized.json
 ```
 
@@ -213,6 +213,6 @@ It writes or updates:
 memory/derived/procedural_knowledge/_target_traces/{evolved_profile}/{framework}/{example}/{function}/trace.json
 memory/derived/procedural_knowledge/{evolved_profile}/{framework}/{example}/practice_knowledge.jsonl
 memory/derived/graph_knowledge/{evolved_profile}/{framework}/{example}/dep_graph.with_knowledge.json
-KOCO-bench-en/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_output.jsonl
-KOCO-bench-en/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_result.jsonl
+praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_output.jsonl
+praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_result.jsonl
 ```

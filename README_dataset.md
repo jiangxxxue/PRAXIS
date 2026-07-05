@@ -85,7 +85,7 @@ docker tag drunkpiano2005/koco-raganything-smolagents:1.0 raganything-smolagents
 Then configure your API key:
 
 ```bash
-cd KOCO-bench-en/domain_code_generation/scripts
+cd praxis/domain_code_generation/scripts
 cp .env.example .env
 # Edit .env and fill in your OPENROUTER_API_KEY (required)
 # Optionally add OPENAI_API_KEY for the knowledge_search embedding tool
@@ -96,7 +96,7 @@ cp .env.example .env
 The OpenHands agent evaluation requires its own Python environment (Python ≥ 3.12). Set it up with [uv](https://docs.astral.sh/uv/):
 
 ```bash
-cd KOCO-bench-en/domain_code_generation/scripts/koco_openhands
+cd praxis/domain_code_generation/scripts/koco_openhands
 uv sync              # creates .venv and installs all dependencies
 uv run pytest tools/knowledge_search/test_knowledge_search.py -v   # verify (optional)
 ```
@@ -113,7 +113,7 @@ uv run pytest tools/knowledge_search/test_knowledge_search.py -v   # verify (opt
 Evaluate a single LLM's code generation ability via the CLI pipeline (prompt construction → API call → Docker execution → metrics):
 
 ```bash
-cd KOCO-bench-en/domain_code_generation/scripts
+cd praxis/domain_code_generation/scripts
 
 # Full pipeline (generate + evaluate + aggregate)
 python cli.py run --framework verl --model deepseek/deepseek-v3.2
@@ -128,7 +128,7 @@ python cli.py score     --framework verl --model deepseek/deepseek-v3.2   # step
 Evaluate an OpenHands agent that explores repositories and implements functions autonomously:
 
 ```bash
-cd KOCO-bench-en/domain_code_generation/scripts/koco_openhands
+cd praxis/domain_code_generation/scripts/koco_openhands
 uv sync   # first time only — installs openhands-sdk, regex, etc.
 
 # Full pipeline (agent infer + evaluate)
@@ -142,7 +142,7 @@ uv run python cli.py eval  --framework verl --model deepseek/deepseek-v3.2   # e
 #### Option 3: Training Custom Models
 
 ```bash
-cd KOCO-bench-en/domain_code_generation/scripts
+cd praxis/domain_code_generation/scripts
 
 # SFT Training
 bash sft/run_finetuning.sh
@@ -160,7 +160,7 @@ bash inference/run_batch_code_generation_with_server.sh
 #### Option 1: One-Click Evaluation (All Datasets)
 
 ```bash
-cd KOCO-bench-en/domain_knowledge_understanding/scripts
+cd praxis/domain_knowledge_understanding/scripts
 
 # Set API key
 export OPENROUTER_API_KEY='sk-or-v1-xxx'
@@ -175,7 +175,7 @@ MODEL="qwen/qwen-2.5-coder-32b-instruct" bash run_evaluation_openrouter.sh
 #### Option 2: Evaluate Single Dataset
 
 ```bash
-cd KOCO-bench-en/domain_knowledge_understanding/scripts
+cd praxis/domain_knowledge_understanding/scripts
 
 # Evaluate only one dataset
 DATASET="cosmos-rl" bash run_evaluation_openrouter.sh
@@ -187,7 +187,7 @@ MODEL="anthropic/claude-sonnet-4.5" DATASET="robocasa" bash run_evaluation_openr
 #### Option 3: Using Python Script Directly
 
 ```bash
-cd KOCO-bench-en/domain_knowledge_understanding/scripts
+cd praxis/domain_knowledge_understanding/scripts
 
 python3 evaluation_openrouter.py \
     --model "qwen/qwen2.5-coder-7b-instruct" \
@@ -200,7 +200,7 @@ python3 evaluation_openrouter.py \
 #### Option 4: Local Model Evaluation
 
 ```bash
-cd KOCO-bench-en/domain_knowledge_understanding/scripts
+cd praxis/domain_knowledge_understanding/scripts
 
 # Start inference server
 bash start_inference_server.sh
@@ -216,15 +216,15 @@ bash stop_inference_server.sh
 ## 📖 Documentation
 
 ### Code Generation Documentation
-- **[Code Generation Scripts README](KOCO-bench-en/domain_code_generation/scripts/README.md)**: Comprehensive guide for code generation evaluation workflow
-- **[Quick Start: Aggregating Metrics](KOCO-bench-en/domain_code_generation/scripts/QUICK_START_AGGREGATE.md)**: Guide for metrics aggregation and comparison
-- **[LoRA Training Guide](KOCO-bench-en/domain_code_generation/scripts/lora/README.md)**: LoRA fine-tuning documentation
-- **[Inference Server Guide](KOCO-bench-en/domain_code_generation/scripts/inference/INFERENCE_SERVER_README.md)**: Local model serving
-- **[Agent Guide](KOCO-bench-en/domain_code_generation/scripts/agent/README.md)**: Agent documentation
+- **[Code Generation Scripts README](praxis/domain_code_generation/scripts/README.md)**: Comprehensive guide for code generation evaluation workflow
+- **[Quick Start: Aggregating Metrics](praxis/domain_code_generation/scripts/QUICK_START_AGGREGATE.md)**: Guide for metrics aggregation and comparison
+- **[LoRA Training Guide](praxis/domain_code_generation/scripts/lora/README.md)**: LoRA fine-tuning documentation
+- **[Inference Server Guide](praxis/domain_code_generation/scripts/inference/INFERENCE_SERVER_README.md)**: Local model serving
+- **[Agent Guide](praxis/domain_code_generation/scripts/agent/README.md)**: Agent documentation
 
 ### Knowledge Understanding Documentation
-- **[Knowledge Understanding Scripts README](KOCO-bench-en/domain_knowledge_understanding/scripts/README.md)**: Guide for running MCQ evaluation
-- **[Local Inference Guide](KOCO-bench-en/domain_knowledge_understanding/scripts/LOCAL_INFERENCE_GUIDE.md)**: Using local models for knowledge understanding
+- **[Knowledge Understanding Scripts README](praxis/domain_knowledge_understanding/scripts/README.md)**: Guide for running MCQ evaluation
+- **[Local Inference Guide](praxis/domain_knowledge_understanding/scripts/LOCAL_INFERENCE_GUIDE.md)**: Using local models for knowledge understanding
 
 
 

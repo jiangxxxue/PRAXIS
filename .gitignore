@@ -3,8 +3,8 @@ data
 logs
 results/
 *.log
-KOCO-bench-en/domain_code_generation/scripts/koco_openhands/run_logs/
-KOCO-bench-en/domain_code_generation/scripts/koco_openhands/memory/derived/
+praxis/domain_code_generation/scripts/koco_openhands/run_logs/
+praxis/domain_code_generation/scripts/koco_openhands/memory/derived/
 
 # Environment variables
 .env
