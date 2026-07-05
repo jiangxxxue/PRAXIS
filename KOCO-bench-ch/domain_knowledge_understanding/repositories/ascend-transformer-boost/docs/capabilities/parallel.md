@@ -1,7 +1,0 @@
-# TensorParallel
-
-# DataParallel
-
-# PipelineParallel
-
-# ExpertParallel

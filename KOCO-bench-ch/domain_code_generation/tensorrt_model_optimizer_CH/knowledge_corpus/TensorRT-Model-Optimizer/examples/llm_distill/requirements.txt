@@ -1,3 +1,0 @@
-pyarrow
-transformers<5.0
-trl>=0.23.0

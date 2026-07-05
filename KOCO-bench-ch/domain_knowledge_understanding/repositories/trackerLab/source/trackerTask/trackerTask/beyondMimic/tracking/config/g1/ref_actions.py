@@ -1,1 +1,0 @@
-# with reference joint pos, and policy outputs, mixed to torque commands

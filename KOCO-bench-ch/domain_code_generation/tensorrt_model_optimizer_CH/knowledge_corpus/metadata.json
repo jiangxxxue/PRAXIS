@@ -1,4 +1,0 @@
-{
-  "framework_name": "tensorrt_model_optimizer",
-  "framework_description": "tensorrt_model_optimizer is a library for optimizing models for NVIDIA TensorRT. It supports various model optimization techniques including quantization, distillation, pruning, speculative decoding and sparsity to accelerate models."
-}

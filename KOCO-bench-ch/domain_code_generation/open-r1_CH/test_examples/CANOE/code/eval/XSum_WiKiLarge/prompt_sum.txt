@@ -1,5 +1,0 @@
-Passage: {}
-
-Refer to the passage above and provide a summary as the response.
-
-Summary:

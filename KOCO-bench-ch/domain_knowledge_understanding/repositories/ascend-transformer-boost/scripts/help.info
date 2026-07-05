@@ -1,6 +1,0 @@
---install-path=<path>             Install to specific path
---install                         Install run mode
---uninstall                       Uninstall run mode
---install-for-all                 Install for all users
---upgrade                         Upgrade run mode
---torch_atb                       Install torch_atb

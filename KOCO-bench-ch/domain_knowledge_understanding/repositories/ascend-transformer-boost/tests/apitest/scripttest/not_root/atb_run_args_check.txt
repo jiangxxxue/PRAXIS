@@ -1,4 +1,0 @@
-cd SCPTS_PACK_DIR
-0
-bash SCPTS_PACK_NAME --check
-0

@@ -1,3 +1,0 @@
-ipywidgets
-nvidia-modelopt[all]
-trl
