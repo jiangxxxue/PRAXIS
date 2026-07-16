@@ -58,7 +58,7 @@ def verify_prompt_file(file_path):
     return results
 
 def main():
-    output_dir = Path('/home/gudako/repo/try/claude-code-domain-dataset/source/output')
+    output_dir = Path(os.environ.get("DOMAIN_OUTPUT_DIR", "source/output"))
 
     print("=" * 60)
     print("Prompt Files Verification")

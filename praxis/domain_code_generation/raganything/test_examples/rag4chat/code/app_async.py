@@ -22,7 +22,7 @@
 #     "isRAG": true,
 #     "stream": true,
 #     "similarity": 0.5,
-#     "apiKey": "sk-6Xc1YUnHfPn98EbWXOE4zA"
+#     "apiKey": "sk-xxx"
 # }
 
 # 调用格式

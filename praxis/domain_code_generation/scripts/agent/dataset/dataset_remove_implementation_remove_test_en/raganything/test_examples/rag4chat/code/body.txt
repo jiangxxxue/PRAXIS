@@ -19,7 +19,7 @@
     "similarity": 0.5,
     "is_summary": false,
     "stream": false,
-    "apiKey": "sk-6Xc1YUnHfPn98EbWXOE4zA"
+    "apiKey": "sk-xxx"
 }
 
 isRAG：是否使用向量知识库

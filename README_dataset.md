@@ -3,8 +3,7 @@
 <div align="center">
 </div>
 
-[![Arxiv](https://img.shields.io/badge/Arxiv-B31B1B?style=for-the-badge&logo=arxiv&logoColor=white)](https://www.arxiv.org/abs/2601.13240)
-[![HuggingFace](https://img.shields.io/badge/HuggingFace-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black)](https://huggingface.co/datasets/xueniki/KOCO-bench)
+<!-- Paper and dataset links removed for double-blind review. -->
 
 
 ## 📋 Overview
@@ -70,16 +69,16 @@ We provide pre-built Docker images for all frameworks. Simply pull and tag them:
 
 ```bash
 # ~80.6 GB
-docker pull drunkpiano2005/koco-verl-openr1:1.0
-docker tag drunkpiano2005/koco-verl-openr1:1.0 kocobench/verl-openr1:v0.4
+docker pull anonymous-koco/koco-verl-openr1:1.0
+docker tag anonymous-koco/koco-verl-openr1:1.0 kocobench/verl-openr1:v0.4
 
 # ~42.4 GB
-docker pull drunkpiano2005/koco-tensorrt:1.0
-docker tag drunkpiano2005/koco-tensorrt:1.0 tensorrt:latest
+docker pull anonymous-koco/koco-tensorrt:1.0
+docker tag anonymous-koco/koco-tensorrt:1.0 tensorrt:latest
 
 # ~5 GB
-docker pull drunkpiano2005/koco-raganything-smolagents:1.0
-docker tag drunkpiano2005/koco-raganything-smolagents:1.0 raganything-smolagents:test
+docker pull anonymous-koco/koco-raganything-smolagents:1.0
+docker tag anonymous-koco/koco-raganything-smolagents:1.0 raganything-smolagents:test
 ```
 
 Then configure your API key:

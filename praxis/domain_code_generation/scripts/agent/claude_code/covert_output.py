@@ -78,7 +78,7 @@ def create_framework_structure_v2():
         "prime": "verl"
     }
     
-    base_dir = Path("/home/gudako/repo/try/daily_try/jiangxue_domaincode/domain_knowledge_dataset")
+    base_dir = Path(os.environ.get("DOMAIN_DATASET_DIR", "domain_knowledge_dataset"))
     output_dir = base_dir / "output"
     
     # Load new implementations summary

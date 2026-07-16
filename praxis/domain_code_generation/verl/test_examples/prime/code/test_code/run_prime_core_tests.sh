@@ -4,7 +4,7 @@
 # These tests don't require complex distributed environments, focusing on verifying core functionality consistency with ground-truth code
 
 # Configure Python environment
-export PATH="/mnt/data/jiangxue/miniconda3/envs/verl_sglang/bin:$PATH"
+export PATH="${CONDA_ENV_BIN:-/opt/conda/envs/verl_sglang/bin}:$PATH"
 
 # Get current script directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"

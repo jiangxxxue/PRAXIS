@@ -30,7 +30,7 @@ FlagScale test code needs to import the `flagscale.train.train_gpt` module, whic
 This is the most reliable method, will install all required dependencies:
 
 ```bash
-cd /home/shixianjie/workspace/Projects/DomainDataset/tensorrt_model_optimizer/test_examples/FlagScale/code
+cd $PROJECT_ROOT/tensorrt_model_optimizer/test_examples/FlagScale/code
 
 # 1. Initialize git submodules (obtain Megatron-LM)
 git submodule update --init --recursive
@@ -55,14 +55,14 @@ python test_forward_step.py
 If you don't want complete installation, you can try:
 
 ```bash
-cd /home/shixianjie/workspace/Projects/DomainDataset/tensorrt_model_optimizer/test_examples/FlagScale/code
+cd $PROJECT_ROOT/tensorrt_model_optimizer/test_examples/FlagScale/code
 
 # 1. Ensure third_party/Megatron-LM exists
 git submodule update --init --recursive
 
 # 2. Add Megatron-LM to PYTHONPATH
-export PYTHONPATH="/home/shixianjie/workspace/Projects/DomainDataset/tensorrt_model_optimizer/test_examples/FlagScale/code:$PYTHONPATH"
-export PYTHONPATH="/home/shixianjie/workspace/Projects/DomainDataset/tensorrt_model_optimizer/test_examples/FlagScale/code/third_party/Megatron-LM:$PYTHONPATH"
+export PYTHONPATH="$PROJECT_ROOT/tensorrt_model_optimizer/test_examples/FlagScale/code:$PYTHONPATH"
+export PYTHONPATH="$PROJECT_ROOT/tensorrt_model_optimizer/test_examples/FlagScale/code/third_party/Megatron-LM:$PYTHONPATH"
 
 # 3. Run tests
 cd test_code
@@ -74,7 +74,7 @@ python test_model_provider.py
 Test code already includes import failure handling. If import fails, tests will automatically skip:
 
 ```bash
-cd /home/shixianjie/workspace/Projects/DomainDataset/tensorrt_model_optimizer/test_examples/FlagScale/code/test_code
+cd $PROJECT_ROOT/tensorrt_model_optimizer/test_examples/FlagScale/code/test_code
 
 # Run directly (will skip all tests, but won't error)
 python test_model_provider.py

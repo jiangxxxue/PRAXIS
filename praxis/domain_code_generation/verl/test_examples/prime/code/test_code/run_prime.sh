@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-export PATH="/mnt/data/jiangxue/miniconda3/envs/verl_sglang/bin:$PATH"
+export PATH="${CONDA_ENV_BIN:-/opt/conda/envs/verl_sglang/bin}:$PATH"
 set -xeuo pipefail
 
 NUM_GPUS=${NUM_GPUS:-8}
 
 MODEL_ID=Qwen2.5-0.5B-Instruct
-MODEL_PATH=/mnt/workspace/jiangxue/LLMs/${MODEL_ID}
+MODEL_PATH=${MODEL_DIR:-/tmp/LLMs}/${MODEL_ID}
 huggingface-cli download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
 
 TRAIN_FILES=code/tests/data/gsm8k/train.parquet

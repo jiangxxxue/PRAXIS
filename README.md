@@ -28,16 +28,16 @@ PRAXIS executes benchmark code in the same Docker images used by KOCO-Bench eval
 
 ```bash
 # Used by verl and open-r1. Approximately 80.6 GB.
-docker pull drunkpiano2005/koco-verl-openr1:1.0
-docker tag drunkpiano2005/koco-verl-openr1:1.0 kocobench/verl-openr1:v0.4
+docker pull anonymous-koco/koco-verl-openr1:1.0
+docker tag anonymous-koco/koco-verl-openr1:1.0 kocobench/verl-openr1:v0.4
 
 # Used by tensorrt_model_optimizer. Approximately 42.4 GB.
-docker pull drunkpiano2005/koco-tensorrt:1.0
-docker tag drunkpiano2005/koco-tensorrt:1.0 tensorrt:latest
+docker pull anonymous-koco/koco-tensorrt:1.0
+docker tag anonymous-koco/koco-tensorrt:1.0 tensorrt:latest
 
 # Used by raganything and smolagents. Approximately 5 GB.
-docker pull drunkpiano2005/koco-raganything-smolagents:1.0
-docker tag drunkpiano2005/koco-raganything-smolagents:1.0 raganything-smolagents:test
+docker pull anonymous-koco/koco-raganything-smolagents:1.0
+docker tag anonymous-koco/koco-raganything-smolagents:1.0 raganything-smolagents:test
 ```
 
 ## Quick Start

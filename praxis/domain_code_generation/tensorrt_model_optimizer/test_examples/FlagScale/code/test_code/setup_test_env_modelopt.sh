@@ -6,7 +6,7 @@
 source ~/miniconda3/bin/activate modelopt
 
 # Set FlagScale code path
-FLAGSCALE_CODE_DIR="/home/shixianjie/workspace/Projects/DomainDataset/tensorrt_model_optimizer/test_examples/FlagScale/code"
+FLAGSCALE_CODE_DIR="${FLAGSCALE_CODE_DIR:-$PROJECT_ROOT/tensorrt_model_optimizer/test_examples/FlagScale/code}"
 
 # Add to PYTHONPATH
 export PYTHONPATH="${FLAGSCALE_CODE_DIR}:${PYTHONPATH}"

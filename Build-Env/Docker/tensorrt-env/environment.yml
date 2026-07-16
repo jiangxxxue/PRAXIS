@@ -504,4 +504,4 @@ dependencies:
       - yarl==1.22.0
       - zarr==2.18.7
       - zipp==3.23.0
-prefix: /home/shixianjie/miniconda3/envs/nemo_full_v311
+
