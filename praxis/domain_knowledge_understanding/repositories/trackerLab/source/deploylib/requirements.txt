@@ -1,5 +1,0 @@
-torch
-numpy
-scipy
-pyyaml
-h5py
