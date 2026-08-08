@@ -5,6 +5,7 @@ from pathlib import Path
 from .config import PROJECT_ROOT
 
 from runner import _stub_one_function, _parse_impl_location
+from memory.observed_memory.workspace import benchmark_target_locations
 
 
 def build_practice_ws(spec: dict, dst: Path) -> dict:
@@ -29,6 +30,13 @@ def build_practice_ws(spec: dict, dst: Path) -> dict:
 
     shutil.copytree(code_src, ws / "code", symlinks=True, ignore=_ignore)
     shutil.copytree(kc_src, ws / "knowledge_corpus", symlinks=True)
+
+    from runner import _stub_gt_functions
+
+    _stub_gt_functions(
+        str(ws / "code"),
+        benchmark_target_locations(framework, example),
+    )
 
     rel, start, end = _parse_impl_location(spec["implementation_location"])
     code_file = ws / "code" / rel

@@ -5,6 +5,18 @@ import subprocess
 from .config import DOCKER_IMAGE
 
 
+def _env_enabled(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _run_docker_cmd(args, timeout=3600, stream=False):
     kwargs = {
         "text": True,
@@ -36,7 +48,7 @@ def ensure_docker_image(image, docker_username=None):
     _run_docker_cmd(["docker", "pull", image], timeout=3600, stream=True)
 
 
-def run_in_docker(script_argv, mounts, image=DOCKER_IMAGE, gpus=True,
+def run_in_docker(script_argv, mounts, image=DOCKER_IMAGE, gpus=None,
                   workdir=None, timeout=600, env=None):
     """Run a command inside a Docker container.
 
@@ -45,8 +57,15 @@ def run_in_docker(script_argv, mounts, image=DOCKER_IMAGE, gpus=True,
     ensure_docker_image(image)
 
     cmd = ["docker", "run", "--rm"]
+    runtime = os.environ.get("PRAXIS_PROCEDURAL_DOCKER_RUNTIME", "").strip()
+    if runtime:
+        cmd += ["--runtime", runtime]
+    if gpus is None:
+        gpus = _env_enabled("PRAXIS_PROCEDURAL_DOCKER_GPUS", default=True)
     if gpus:
         cmd += ["--gpus", "all"]
+    else:
+        cmd += ["-e", "CUDA_VISIBLE_DEVICES="]
     if platform.system() == "Linux":
         cmd += ["--user", f"{os.getuid()}:{os.getgid()}",
                 "-e", "HOME=/tmp",

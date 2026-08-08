@@ -32,6 +32,7 @@ from runner import (
     save_jsonl,
 )
 from agent.sdk import _resolve_llm_model
+from memory.knowledge_mount import attach_node_source_code
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -188,9 +189,11 @@ class TestParseImplLocation:
         path, start, end = _parse_impl_location("src/module.py:line 10-20")
         assert path == "src/module.py"
 
-    def test_invalid_no_line(self):
+    def test_line_range_without_line_label(self):
         path, start, end = _parse_impl_location("src/module.py:10-20")
-        assert path is None
+        assert path == "src/module.py"
+        assert start == 10
+        assert end == 20
 
     def test_invalid_no_dash(self):
         path, start, end = _parse_impl_location("code/file.py:line 10")
@@ -349,13 +352,7 @@ class TestStubOneFunctionRegex:
         assert "raise NotImplementedError" in text
         assert "def foo(x):" in text
 
-    def test_multiline_signature_bug(self):
-        """BUG: regex fallback breaks multi-line signatures.
-
-        The continuation-line detection stops at parameter lines because
-        they are non-empty and don't start with '#' or '@'. This causes
-        the stub to replace the parameter list.
-        """
+    def test_preserves_multiline_signature(self):
         code = """\
         def foo(
             a,
@@ -366,12 +363,10 @@ class TestStubOneFunctionRegex:
         lines = self._make_lines(code)
         result = _stub_one_function_regex(lines, 1, 5)
         text = "".join(result)
-        # This SHOULD preserve "a," and "b," but currently doesn't
-        # The regex fallback replaces from the first non-empty line after def
-        # Documenting the current (buggy) behavior:
         assert "raise NotImplementedError" in text
-        # The parameter list is incorrectly removed:
-        assert "a," not in text  # BUG: parameters are stripped
+        assert "a," in text
+        assert "b," in text
+        assert "return a + b" not in text
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -546,6 +541,81 @@ class TestPrepareWorkspace:
         # Original should be untouched
         original = open(os.path.join(ws_root, "main.py")).read()
         assert "return 1" in original
+
+
+class TestKnowledgeMountSourceMasking:
+
+    def test_function_node_fully_hidden(self, tmp_path):
+        source = tmp_path / "module.py"
+        source.write_text("def target():\n    return 1\n")
+        nodes = [{
+            "file_path": "module.py",
+            "lineno": 1,
+            "end_lineno": 2,
+        }]
+
+        attach_node_source_code(nodes, tmp_path, {"module.py": [(1, 2)]})
+
+        node = nodes[0]
+        assert node["source_code"] == ""
+        assert node["benchmark_target_hidden"] is True
+        assert node["benchmark_target_mask"] == "full"
+        assert node["source_code_error"] == "benchmark_target_hidden"
+
+    def test_class_node_keeps_non_target_context(self, tmp_path):
+        source = tmp_path / "module.py"
+        source.write_text(textwrap.dedent("""\
+        class Worker:
+            def keep(self):
+                return "safe"
+
+            def target(self):
+                secret = 42
+                return secret
+
+            def also_keep(self):
+                return "also safe"
+        """))
+        nodes = [{
+            "file_path": "module.py",
+            "lineno": 1,
+            "end_lineno": 10,
+        }]
+
+        attach_node_source_code(nodes, tmp_path, {"module.py": [(5, 7)]})
+
+        source_code = nodes[0]["source_code"]
+        assert "class Worker:" in source_code
+        assert 'return "safe"' in source_code
+        assert 'return "also safe"' in source_code
+        assert "secret = 42" not in source_code
+        assert "return secret" not in source_code
+        assert "BENCHMARK TARGET SOURCE HIDDEN" in source_code
+        assert nodes[0]["benchmark_target_mask"] == "partial"
+        assert nodes[0]["source_code_error"] == "benchmark_target_partially_hidden"
+
+    def test_non_function_target_range_is_partially_hidden(self, tmp_path):
+        source = tmp_path / "module.py"
+        source.write_text(textwrap.dedent("""\
+        def outer():
+            x = 1
+            y = x + 1
+            return y
+        """))
+        nodes = [{
+            "file_path": "module.py",
+            "lineno": 1,
+            "end_lineno": 4,
+        }]
+
+        attach_node_source_code(nodes, tmp_path, {"module.py": [(2, 3)]})
+
+        source_code = nodes[0]["source_code"]
+        assert "def outer" in source_code
+        assert "x = 1" not in source_code
+        assert "y = x + 1" not in source_code
+        assert "return y" in source_code
+        assert nodes[0]["benchmark_target_mask"] == "partial"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -834,8 +904,7 @@ class TestExtractFromEvents:
         result = _extract_from_events(events, "target")
         assert "return x * 2" in result
 
-    def test_async_def_not_matched(self):
-        """BUG: regex doesn't handle async def."""
+    def test_extracts_async_def(self):
         code = "async def fetch(url):\n    return await get(url)\n"
         events = [_FakeEvent(
             tool_name="file_editor",
@@ -846,8 +915,8 @@ class TestExtractFromEvents:
             },
         )]
         result = _extract_from_events(events, "fetch")
-        # Current implementation misses async def — documenting this bug
-        assert result == ""  # BUG: should find async def fetch
+        assert result.startswith("async def fetch(url):")
+        assert "return await get(url)" in result
 
 
 # ═══════════════════════════════════════════════════════════════════════════

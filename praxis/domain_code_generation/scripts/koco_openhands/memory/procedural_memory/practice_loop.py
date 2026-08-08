@@ -50,28 +50,17 @@ def run_practice(spec, *, K=8, model, api_key, base_url,
         trace["stopped_early"] = stopped_early
         trace_path.write_text(json.dumps(trace, indent=2, default=str))
 
-    # Build workspace in a temp directory — auto-cleaned on exit.
-    # Valuable data (completions, grades, events) is saved to trace JSON;
-    # the workspace itself is a disposable intermediate artifact.
-    with tempfile.TemporaryDirectory(prefix="koco_practice_") as tmp_dir:
-        # Pass a subdirectory so build_practice_ws's rmtree guard
-        # never deletes the TemporaryDirectory root itself.
-        workspace_root = Path(tmp_dir) / "ws"
-        repo_paths = build_practice_ws(spec, workspace_root)
+    try:
+        for i in range(K):
+            # Each attempt receives a fresh workspace. An agent that violates
+            # the prompt and edits another file cannot influence later attempts.
+            with tempfile.TemporaryDirectory(prefix="koco_practice_") as tmp_dir:
+                workspace_root = Path(tmp_dir) / "ws"
+                repo_paths = build_practice_ws(spec, workspace_root)
 
-        rel, _, _ = _parse_impl_location(spec["implementation_location"])
-        stub_file = os.path.join(repo_paths["code"], rel)
-        stubbed_source = Path(stub_file).read_text()
-
-        try:
-            for i in range(K):
+                rel, _, _ = _parse_impl_location(spec["implementation_location"])
+                stub_file = os.path.join(repo_paths["code"], rel)
                 print(f"practice: iter {i + 1}/{K} — running agent ...")
-                # Restore the known-good stub before each iteration. The
-                # previous attempt may have left syntactically invalid code,
-                # so re-parsing the current file is not reliable.
-                if i > 0:
-                    Path(stub_file).write_text(stubbed_source)
-
                 attempt = run_practice_attempt(
                     spec, i, prior_attempts,
                     model=model, api_key=api_key, base_url=base_url,
@@ -106,7 +95,7 @@ def run_practice(spec, *, K=8, model, api_key, base_url,
                     print(f"practice: first PASS at iter {i + 1}/{K} — stopping early")
                     stopped_early = True
                     break
-        finally:
-            _persist()
+    finally:
+        _persist()
 
     return trace

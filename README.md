@@ -1,17 +1,16 @@
 # PRAXIS
 
-This repository provides the source code for Work "PRAXIS: Graph-Grounded Tacit Knowledge for Domain Code Generation".
+Source code for "PRAXIS: Graph-Grounded Tacit Knowledge for Domain Code
+Generation".
 
-PRAXIS has four stages:
+PRAXIS runs four stages in order:
 
-1. **In-Domain Development Practice**: observe projects, select practice targets, generate and repair executable test inputs.
-2. **Structured Knowledge Acquisition**: practice selected functions and distill traces into structured procedural knowledge.
-3. **Graph-Grounded Knowledge Organization**: mount structured knowledge onto dependency graphs and optimize it.
-4. **Tacit Knowledge Injection**: run OpenHands inference with observed memory and optimized graph knowledge, then evaluate.
+1. In-domain development practice
+2. Structured knowledge acquisition
+3. Graph-grounded knowledge organization
+4. Tacit knowledge injection and evaluation
 
 ## Setup
-
-From a fresh clone:
 
 ```bash
 cd PRAXIS
@@ -20,29 +19,37 @@ export OPENHANDS_DIR="$REPO_ROOT/praxis/domain_code_generation/scripts/koco_open
 cd "$OPENHANDS_DIR"
 
 uv sync
-
-export OPENROUTER_API_KEY="${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY first}"
+export OPENROUTER_API_KEY="..."
 ```
 
-PRAXIS executes benchmark code in the same Docker images used by KOCO-Bench evaluation. Pull and tag the pre-built images before running coverage, procedural grading, or evaluation:
+The same OpenRouter key is used for chat models and semantic embeddings by
+default. If your embedding service uses a different provider or credential,
+override it explicitly:
 
 ```bash
-# Used by verl and open-r1. Approximately 80.6 GB.
+export EMBEDDING_API_KEY="..."
+export EMBEDDING_API_BASE="https://api.openai.com/v1"
+export EMBEDDING_MODEL="openai/text-embedding-3-small"
+```
+
+Without an available embedding key, knowledge search uses BM25 only.
+
+## Docker Images
+
+```bash
 docker pull anonymous-koco/koco-verl-openr1:1.0
 docker tag anonymous-koco/koco-verl-openr1:1.0 kocobench/verl-openr1:v0.4
 
-# Used by tensorrt_model_optimizer. Approximately 42.4 GB.
 docker pull anonymous-koco/koco-tensorrt:1.0
 docker tag anonymous-koco/koco-tensorrt:1.0 tensorrt:latest
 
-# Used by raganything and smolagents. Approximately 5 GB.
 docker pull anonymous-koco/koco-raganything-smolagents:1.0
 docker tag anonymous-koco/koco-raganything-smolagents:1.0 raganything-smolagents:test
 ```
 
-## Quick Start
+## Experiment
 
-By default, PRAXIS runs all supported code-generation frameworks with DeepSeek V3.2:
+Configure one run before executing any stage:
 
 ```bash
 export MODEL=deepseek/deepseek-v3.2
@@ -50,9 +57,7 @@ export PROFILE=deepseek_v3_2_full
 export FRAMEWORKS="verl open-r1 raganything smolagents tensorrt_model_optimizer"
 ```
 
-That is the standard full-framework PRAXIS workflow.
-
-For a focused end-to-end run, restrict the workflow to one framework and one test example:
+For a focused run:
 
 ```bash
 export FRAMEWORKS="verl"
@@ -60,159 +65,40 @@ export PRAXIS_EXAMPLES="prime"
 export PROFILE=deepseek_v3_2_verl_prime
 ```
 
-## Stage 1: In-Domain Development Practice
+Keep the same model, profile, frameworks, and examples when resuming an
+experiment. Set `PRAXIS_RUN_PROFILE` explicitly only when resuming artifacts
+created under an explicit run profile.
+
+## Run
+
+Run each stage after the previous stage finishes:
 
 ```bash
+# Stage 1
 bash memory/scripts/in_domain_practice.sh
-```
 
-This stage creates the in-domain development substrate used by later stages. It explores each project, selects practice-worthy functions, generates executable test inputs, measures coverage, and uses feedback to repair weak tests.
-
-Each step is retried once by default. If an OpenHands agent gets stuck or exits before producing the expected artifact, increase the relevant limit and rerun the same script:
-
-```bash
-export PRAXIS_STAGE_RETRIES=2
-export PRAXIS_OBSERVED_MAX_ITERATIONS=150
-export PRAXIS_SELECT_MAX_ITERATIONS=150
-export PRAXIS_GENERATE_MAX_ITERATIONS=150
-export PRAXIS_FEEDBACK_MAX_ITERATIONS=150
-```
-
-PRAXIS keeps OpenHands stuck detection enabled, but uses wider thresholds than the SDK defaults. For difficult generation cases, relax or disable the detector explicitly:
-
-```bash
-export KOCO_OPENHANDS_STUCK_ACTION_OBSERVATION=12
-export KOCO_OPENHANDS_STUCK_ACTION_ERROR=6
-export KOCO_OPENHANDS_STUCK_MONOLOGUE=8
-export KOCO_OPENHANDS_STUCK_ALTERNATING_PATTERN=14
-```
-
-It runs, for every configured framework and example:
-
-```text
-memory init
-memory select --strategy llm
-memory generate
-memory coverage
-memory feedback
-```
-
-It produces:
-
-```text
-memory/derived/observed_knowledge/{framework}/{example}.md
-memory/derived/observed_knowledge/{framework}/{example}/candidates.json
-memory/derived/observed_knowledge/{framework}/{example}/{function}_requirement.md
-memory/derived/observed_knowledge/{framework}/{example}/{function}_test_input.py
-memory/derived/observed_knowledge/{framework}/{example}/{function}_coverage.json
-memory/derived/observed_knowledge/{framework}/{example}/{function}_feedback_log.json
-memory/derived/graph_knowledge/{framework}/{example}/dep_graph.json
-```
-
-## Stage 2: Structured Knowledge Acquisition
-
-```bash
+# Stage 2
 bash memory/scripts/structured_knowledge_acquisition.sh
-```
 
-This stage reads each `candidates.json`, keeps only functions whose Stage 1 coverage is at or above `PRAXIS_COVERAGE_THRESHOLD`, practices those functions, and consolidates structured procedural knowledge:
-
-```text
-procedural init
-procedural grade-smoke
-procedural practice
-procedural distill-structured
-procedural consolidate-structured
-```
-
-It produces:
-
-```text
-memory/derived/procedural_knowledge/_traces/{profile}/{framework}/{example}/{function}/pilot_spec.json
-memory/derived/procedural_knowledge/_traces/{profile}/{framework}/{example}/{function}/oracle.json
-memory/derived/procedural_knowledge/_traces/{profile}/{framework}/{example}/{function}/trace.json
-memory/derived/procedural_knowledge/{profile}/{framework}/{example}/per_function/{function}.jsonl
-memory/derived/procedural_knowledge/{profile}/{framework}/{example}/practice_knowledge.jsonl
-```
-
-## Stage 3: Graph-Grounded Knowledge Organization
-
-```bash
+# Stage 3
 bash memory/scripts/graph_grounded_organization.sh
-```
 
-This stage mounts procedural knowledge onto dependency graphs and optimizes graph-mounted knowledge:
-
-```text
-memory.knowledge_mount
-memory.optimize_graph_knowledge
-```
-
-It produces:
-
-```text
-memory/derived/graph_knowledge/{profile}/{framework}/{example}/dep_graph.with_knowledge.json
-memory/derived/graph_knowledge/{profile}/{framework}/{example}/dep_graph.with_knowledge.optimized.json
-```
-
-The default propagation decision cap is `1000`. To remove the cap:
-
-```bash
-export PRAXIS_MAX_PROPAGATION_DECISIONS=0
-```
-
-## Stage 4: Tacit Knowledge Injection
-
-```bash
+# Stage 4
 bash memory/scripts/tacit_knowledge_injection.sh
 ```
 
-This stage runs OpenHands inference and evaluation using optimized graph knowledge:
+Stage 1 and Stage 4 reuse completed work. Re-run an interrupted stage with the
+same experiment configuration; see the stage-specific documentation for exact
+resume and rebuild behavior.
 
-```text
-cli.py run --graph-knowledge-artifact optimized
-```
-
-It produces:
-
-```text
-praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_output.jsonl
-praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_result.jsonl
-praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_result.metrics.json
-praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/agent_logs/{example}/{function}/task_prompt.txt
-praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/agent_logs/{example}/{function}/sdk_events.json
-praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/agent_logs/{example}/{function}/tool_trace.jsonl
-```
-
-## Optional: Online Knowledge Evolution
-
-After Stage 4, PRAXIS can evolve its knowledge online from inference trajectories. This loop imports target-practice traces, distills target memories, consolidates them into procedural knowledge, mounts the resulting target-function practice knowledge onto the previously optimized graph, and runs inference/evaluation again with the mounted graph. It does not run another graph-knowledge propagation pass.
+Optional online evolution after Stage 4:
 
 ```bash
 bash memory/scripts/online_knowledge_evolution.sh
 ```
 
-By default, online evolution writes graph artifacts under a new profile:
+## Details
 
-```bash
-export PRAXIS_EVOLVED_PROFILE="${PROFILE}_online"
-```
-
-This loop reads:
-
-```text
-praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_output.jsonl
-praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_result.jsonl
-praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/agent_logs/{example}/{function}/
-memory/derived/graph_knowledge/{profile}/{framework}/{example}/dep_graph.with_knowledge.optimized.json
-```
-
-It writes or updates:
-
-```text
-memory/derived/procedural_knowledge/_target_traces/{evolved_profile}/{framework}/{example}/{function}/trace.json
-memory/derived/procedural_knowledge/{evolved_profile}/{framework}/{example}/practice_knowledge.jsonl
-memory/derived/graph_knowledge/{evolved_profile}/{framework}/{example}/dep_graph.with_knowledge.json
-praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_output.jsonl
-praxis/domain_code_generation/scripts/data/{framework}/openhands/{model_dir}/algorithm_methods_data_{example}_result.jsonl
-```
+- [Stage 1: observed memory](praxis/domain_code_generation/scripts/koco_openhands/memory/observed_memory/README.md)
+- [Stage 2: procedural memory](praxis/domain_code_generation/scripts/koco_openhands/memory/procedural_memory/README.md)
+- [Stages 3, 4, and online evolution](praxis/domain_code_generation/scripts/koco_openhands/memory/README.md)

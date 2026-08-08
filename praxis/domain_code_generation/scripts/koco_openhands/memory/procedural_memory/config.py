@@ -4,6 +4,7 @@ from config import get_docker_image
 
 from ..config import (
     KOCO_OPENHANDS_DIR,
+    MEMORY_RUN_ID,
     OBSERVED_KNOWLEDGE_DIR,
     PRACTICE_KNOWLEDGE_DIR,
     PROJECT_ROOT,
@@ -30,7 +31,7 @@ def output_profile_for_set(profile: str | None = None) -> str:
 
 def derived_dir_for_set(derived_set: str | None = None) -> Path:
     """Return the observed-memory root used as procedural-memory input."""
-    return OBSERVED_KNOWLEDGE_DIR
+    return OBSERVED_KNOWLEDGE_DIR / MEMORY_RUN_ID if MEMORY_RUN_ID else OBSERVED_KNOWLEDGE_DIR
 
 
 def trace_function_dir(framework: str, example: str, function_name: str,

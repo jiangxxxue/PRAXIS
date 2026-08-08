@@ -9,6 +9,22 @@ import shutil
 from runner import _stub_gt_functions, _stub_one_function
 
 
+def benchmark_target_locations(framework: str, example: str) -> dict:
+    """Load all benchmark target ranges for one example."""
+    from memory.config import SCRIPTS_DIR, ensure_input_data
+    from runner import _collect_gt_locations, load_jsonl
+
+    data_file = (
+        SCRIPTS_DIR
+        / "data"
+        / framework
+        / f"algorithm_methods_data_{example}.jsonl"
+    )
+    if not data_file.exists() and not ensure_input_data(framework, example):
+        raise RuntimeError(f"Failed to generate benchmark target data for {example}")
+    return _collect_gt_locations(load_jsonl(str(data_file)))
+
+
 def build_explore_workspace(code_root: str, gt_locations: dict, tmp_dir: str) -> dict:
     """Copy code/ only (exclude test_code/), stub all GT functions.
 
@@ -59,7 +75,8 @@ def build_single_stub_workspace(
 
     shutil.copytree(code_root, code_dst, symlinks=True, ignore=_ignore)
 
-    # Stub only the target function
+    # Hide every benchmark target first, then stub the selected practice target.
+    _stub_gt_functions(code_dst, gt_locations)
     file_path = os.path.join(code_dst, target_file)
     if os.path.exists(file_path):
         with open(file_path, "r", encoding="utf-8") as f:

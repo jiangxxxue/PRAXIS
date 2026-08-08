@@ -49,6 +49,7 @@ For each subsystem identified in Pass 1:
 - Skip a deeply nested directory because it "looks similar" to something you've already seen.
 
 ## Guidelines
+- **Hidden benchmark targets**: Some function bodies are intentionally replaced by `raise NotImplementedError`. Treat those functions as opaque interfaces. You may document their signatures, docstrings, callers, and callees, but do not infer or reconstruct their hidden implementations.
 - **Project first, framework second**: Describe the framework only when it helps understand the project. Don't document the framework's general API — document how this project *uses* it.
 - **Concrete over abstract**: Specific function signatures, parameter names, and data shapes are more useful than abstract descriptions. "Takes a DataProto with `input_ids`, `attention_mask`" is better than "takes a DataProto."
 - **Relationships matter**: Which function calls which, what data passes between them — these connections are as important as individual function descriptions.

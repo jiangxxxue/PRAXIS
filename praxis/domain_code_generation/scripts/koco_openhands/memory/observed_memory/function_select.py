@@ -11,7 +11,7 @@ Supports multiple selection strategies via the ``strategy`` parameter:
 import json
 import os
 import tempfile
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from agent.sdk import run_sdk_agent
@@ -27,6 +27,7 @@ _LLM_STRATEGIES = {
 
 # Programmatic strategies (no LLM, pure script)
 _PROGRAMMATIC_STRATEGIES = {"indegree", "outdegree"}
+_DEFAULT_PROGRAMMATIC_TOP_K = 10
 
 
 def _run_llm_select(
@@ -107,18 +108,67 @@ def _run_programmatic_select(
 ) -> list[dict]:
     """Run a programmatic call-graph strategy (no LLM needed)."""
     from memory.config import ensure_input_data, SCRIPTS_DIR
-    from memory.observed_memory.select_callgraph import select_by_strategy
+    from memory.observed_memory.build_dep_graph import build_dep_graph
 
     data_file = SCRIPTS_DIR / "data" / framework / f"algorithm_methods_data_{example}.jsonl"
     if not data_file.exists():
         if not ensure_input_data(framework, example):
             raise RuntimeError(f"Failed to generate input data for {example}")
 
+    records = load_jsonl(str(data_file))
+    gt_locations = _collect_gt_locations(records)
     code_root = str(code_dir(framework, example))
-    return select_by_strategy(
-        strategy, str(data_file), code_root,
-        top_k=top_k, framework=framework, example=example,
-    )
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        paths = build_explore_workspace(code_root, gt_locations, tmp_dir)
+        graph = build_dep_graph(paths["code"], framework, example)
+
+    scores: dict[str, int] = defaultdict(int)
+    for edge in graph.get("edges", []):
+        if edge.get("kind") not in {"call", "data"}:
+            continue
+        endpoint = "target" if strategy == "indegree" else "source"
+        node_id = str(edge.get(endpoint) or "")
+        if node_id:
+            scores[node_id] += 1
+
+    ranked = []
+    target_names = {
+        str(record.get("function_name") or "")
+        for record in records
+    }
+    target_locations = {
+        _normalized_location_key(record.get("implementation_location", ""))
+        for record in records
+    }
+    for node in graph.get("nodes", []):
+        if node.get("kind") not in {"function", "method"}:
+            continue
+        node_id = str(node.get("id") or "")
+        file_path = str(node.get("file_path") or "")
+        start = int(node.get("lineno") or 0)
+        end = int(node.get("end_lineno") or start)
+        if not node_id or not file_path or start <= 0 or end < start:
+            continue
+        candidate = {
+            "function_name": node_id,
+            "implementation_location": f"code/{file_path}:line {start}-{end}",
+            "rationale": f"{strategy}={scores.get(node_id, 0)}",
+        }
+        if (
+            node_id in target_names
+            or _normalized_location_key(candidate["implementation_location"])
+            in target_locations
+        ):
+            continue
+        ranked.append((
+            -scores.get(node_id, 0),
+            node_id,
+            candidate,
+        ))
+
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    limit = top_k if top_k is not None else _DEFAULT_PROGRAMMATIC_TOP_K
+    return [item[2] for item in ranked[:limit]]
 
 
 def _filter_by_scope(
@@ -381,14 +431,14 @@ def run_select(
     api_key: str,
     base_url: str = "https://openrouter.ai/api/v1",
     max_iterations: int = 100,
-    strategy: str = "llm",
+    strategy: str = "business_logic,indegree,outdegree",
     top_k: int | None = None,
 ) -> Path:
     """Stage 2: Select candidate functions for practice.
 
     Args:
-        strategy: "llm", "business_logic" (LLM), "indegree", "outdegree" (script),
-                  "all" (all 4), or comma-separated (e.g. "llm,indegree").
+        strategy: "business_logic,indegree,outdegree" by default; also accepts
+                  "llm", "all", or any valid comma-separated combination.
         top_k: Max candidates for programmatic strategies.
 
     Returns path to written observed-memory candidates.json.
@@ -399,9 +449,15 @@ def run_select(
     for i, strat in enumerate(strategies):
         if strat in _LLM_STRATEGIES:
             print(f"  Running strategy [{i+1}/{len(strategies)}]: {strat} (LLM)")
-            candidates = _run_llm_select(
-                framework, example, model, api_key, base_url, max_iterations, strat,
-            )
+            try:
+                candidates = _run_llm_select(
+                    framework, example, model, api_key, base_url, max_iterations, strat,
+                )
+            except Exception as exc:
+                if len(strategies) == 1:
+                    raise
+                print(f"    WARN: {strat} strategy failed; continuing: {exc}")
+                continue
         elif strat in _PROGRAMMATIC_STRATEGIES:
             print(f"  Running strategy [{i+1}/{len(strategies)}]: {strat} (script)")
             candidates = _run_programmatic_select(framework, example, strat, top_k)

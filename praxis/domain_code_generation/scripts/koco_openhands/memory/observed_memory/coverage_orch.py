@@ -8,20 +8,51 @@ import json
 import os
 import platform
 import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from hashlib import sha256
 from pathlib import Path
+from uuid import uuid4
 
 from memory.config import (
-    DERIVED_DIR,
     PROJECT_ROOT,
     SCRIPTS_DIR,
     candidates_path,
     code_dir,
     coverage_result_path,
+    feedback_status_path,
     test_input_path,
 )
+from memory.observed_memory.quality import coverage_has_execution_failure
+
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from config import get_docker_image
 
 # Module-level cache for GPU availability test (run once per CLI invocation)
 _gpu_cache = {}  # {image: bool}
+
+
+def _coverage_docker_runtime() -> str | None:
+    """Return the Docker runtime to use for coverage containers.
+
+    Some shared servers configure Docker's default runtime as ``nvidia``. That
+    can make CPU-only coverage fail before the container starts when the NVIDIA
+    container runtime cannot inspect host GPUs. Force plain runc by default and
+    allow callers to override it when needed.
+    """
+    value = os.environ.get("PRAXIS_COVERAGE_DOCKER_RUNTIME", "runc").strip()
+    return value or None
+
+
+def _coverage_docker_gpus_enabled() -> bool:
+    return os.environ.get("PRAXIS_COVERAGE_DOCKER_GPUS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _gpu_ready(image: str) -> bool:
@@ -53,6 +84,267 @@ def _parse_location(location: str) -> tuple[str, int, int]:
         return path_part, int(start_s), int(end_s)
     except ValueError:
         return path_part, 0, 0
+
+
+def _existing_test_input_path(
+    framework: str,
+    example: str,
+    function_name: str,
+) -> Path | None:
+    path = test_input_path(framework, example, function_name)
+    if path.exists():
+        return path
+    if "." in function_name:
+        leaf_path = test_input_path(
+            framework,
+            example,
+            function_name.rsplit(".", 1)[-1],
+        )
+        if leaf_path.exists() and _test_input_matches_function(
+            leaf_path,
+            function_name,
+        ):
+            return leaf_path
+    return None
+
+
+def _test_input_matches_function(path: Path, function_name: str) -> bool:
+    """Return whether a legacy leaf-name input declares the requested target."""
+    import ast
+
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return False
+
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(
+            isinstance(target, ast.Name) and target.id == "FUNCTION_NAME"
+            for target in targets
+        ):
+            continue
+        value = node.value
+        return (
+            isinstance(value, ast.Constant)
+            and value.value == function_name
+        )
+    return False
+
+
+def _coverage_fingerprint(
+    *,
+    test_input: Path,
+    source_file: Path,
+    runner_file: Path,
+    implementation_location: str,
+    per_test: bool,
+    capture_output: bool,
+    execution_context: str,
+) -> str:
+    digest = sha256()
+    for path in (test_input, source_file, runner_file):
+        digest.update(str(path).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    digest.update(implementation_location.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(str(per_test).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(str(capture_output).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(execution_context.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _coverage_python_overlay(framework: str, example: str) -> Path | None:
+    suffix = "".join(
+        char if char.isalnum() else "_"
+        for char in f"{framework}_{example}"
+    ).upper()
+    value = os.environ.get(
+        f"PRAXIS_COVERAGE_PYTHONPATH_{suffix}",
+        "",
+    ).strip()
+    if not value:
+        return None
+
+    path = Path(value).expanduser().resolve()
+    if not path.is_dir():
+        raise RuntimeError(f"Coverage Python overlay does not exist: {path}")
+    try:
+        path.relative_to(PROJECT_ROOT.resolve())
+    except ValueError as exc:
+        raise RuntimeError(
+            "Coverage Python overlays must be inside PROJECT_ROOT so Docker "
+            f"can access them: {path}"
+        ) from exc
+    return path
+
+
+def _coverage_overlay_signature(path: Path) -> str:
+    digest = sha256()
+    files = (
+        item
+        for item in path.rglob("*")
+        if item.is_file()
+        and "__pycache__" not in item.parts
+        and item.suffix != ".pyc"
+    )
+    for child in sorted(files):
+        digest.update(str(child.relative_to(path)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(child.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _coverage_execution_context(
+    framework: str,
+    native: bool,
+    example: str = "",
+) -> str:
+    overlay = _coverage_python_overlay(framework, example)
+    overlay_context = ""
+    if overlay is not None:
+        overlay_context = (
+            f":pythonpath={overlay}:"
+            f"signature={_coverage_overlay_signature(overlay)}"
+        )
+
+    if native:
+        return f"native:{sys.executable}{overlay_context}"
+
+    return (
+        f"docker:{get_docker_image(framework)}:"
+        f"runtime={_coverage_docker_runtime()}:"
+        f"gpus={_coverage_docker_gpus_enabled()}"
+        f"{overlay_context}"
+    )
+
+
+def _load_reusable_coverage(
+    output_path: Path,
+    *,
+    dependencies: list[Path],
+    fingerprint: str,
+) -> dict | None:
+    if not output_path.is_file():
+        return None
+    try:
+        data = json.loads(output_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or coverage_has_execution_failure(data):
+        return None
+    if not isinstance(data.get("line_coverage"), (int, float)):
+        return None
+
+    metadata = data.get("_praxis_coverage")
+    if isinstance(metadata, dict) and metadata.get("fingerprint"):
+        return data if metadata["fingerprint"] == fingerprint else None
+
+    try:
+        output_mtime = output_path.stat().st_mtime_ns
+        if any(
+            not dependency.is_file()
+            or dependency.stat().st_mtime_ns > output_mtime
+            for dependency in dependencies
+        ):
+            return None
+    except OSError:
+        return None
+    return data
+
+
+def _coverage_metadata(
+    *,
+    framework: str,
+    example: str,
+    test_input: Path,
+    source_file: Path,
+    target_signature: str,
+    per_test: bool,
+    capture_output: bool,
+    native: bool,
+) -> dict:
+    return {
+        "fingerprint": _coverage_fingerprint(
+            test_input=test_input,
+            source_file=source_file,
+            runner_file=Path(__file__).with_name("coverage_runner.py"),
+            implementation_location=target_signature,
+            per_test=per_test,
+            capture_output=capture_output,
+            execution_context=_coverage_execution_context(
+                framework,
+                native,
+                example=example,
+            ),
+        ),
+        "per_test": per_test,
+        "capture_output": capture_output,
+    }
+
+
+def _save_coverage_data(
+    framework: str,
+    example: str,
+    function_name: str,
+    data: dict,
+    *,
+    test_input: Path,
+    source_file: Path,
+    target_signature: str,
+    per_test: bool,
+    capture_output: bool,
+    native: bool,
+) -> dict:
+    data["_praxis_coverage"] = _coverage_metadata(
+        framework=framework,
+        example=example,
+        test_input=test_input,
+        source_file=source_file,
+        target_signature=target_signature,
+        per_test=per_test,
+        capture_output=capture_output,
+        native=native,
+    )
+    out = coverage_result_path(framework, example, function_name)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return data
+
+
+def _feedback_accepts_failed_coverage(
+    framework: str,
+    example: str,
+    function_name: str,
+    coverage_data: dict,
+) -> bool:
+    metadata = coverage_data.get("_praxis_coverage")
+    if not isinstance(metadata, dict) or not metadata.get("fingerprint"):
+        return False
+    try:
+        feedback_status = json.loads(
+            feedback_status_path(
+                framework,
+                example,
+                function_name,
+            ).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return False
+    if feedback_status.get("status") not in {"exhausted", "unrunnable"}:
+        return False
+    details = feedback_status.get("details")
+    return (
+        isinstance(details, dict)
+        and details.get("coverage_fingerprint") == metadata["fingerprint"]
+    )
 
 
 def _load_gt_locations_from_jsonl(framework: str, example: str) -> dict[str, tuple[str, int, int]]:
@@ -101,8 +393,6 @@ def run_coverage_single(
     coverage_runner.py directly on the host — useful when Docker is unavailable
     or unnecessary (e.g. autodl GPU instances).
     """
-    from config import get_docker_image
-
     # Find candidate metadata
     cands_path = candidates_path(framework, example)
     if not cands_path.exists():
@@ -116,12 +406,8 @@ def run_coverage_single(
         return None
 
     # Verify test_input exists (try full name, then leaf name fallback)
-    ti_path = test_input_path(framework, example, function_name)
-    if not ti_path.exists():
-        leaf = function_name.rsplit(".", 1)[-1] if "." in function_name else ""
-        if leaf and leaf != function_name:
-            ti_path = test_input_path(framework, example, leaf)
-    if not ti_path.exists():
+    ti_path = _existing_test_input_path(framework, example, function_name)
+    if ti_path is None:
         print(f"  SKIP {function_name}: test_input.py not found")
         return None
 
@@ -135,6 +421,10 @@ def run_coverage_single(
             resolved_name = entry[3]
     else:
         source_file, line_start, line_end = _parse_location(target["implementation_location"])
+    source_path = code_dir(framework, example) / source_file
+    target_signature = (
+        f"{source_file}:{line_start}-{line_end}:{resolved_name}"
+    )
 
     # Docker paths
     image = get_docker_image(framework)
@@ -144,22 +434,31 @@ def run_coverage_single(
     ctr_source_dir = f"{mnt}/{framework}/test_examples/{example}/code"
     ctr_runner = f"{mnt}/scripts/koco_openhands/memory/observed_memory/coverage_runner.py"
 
-    # Derive container paths from the host DERIVED_DIR relative to PROJECT_ROOT
-    derived_rel = DERIVED_DIR.relative_to(PROJECT_ROOT)
-    ctr_test_input = f"{mnt}/{derived_rel}/observed_knowledge/{framework}/{example}/{function_name}_test_input.py"
-    ctr_output = f"{mnt}/{derived_rel}/observed_knowledge/{framework}/{example}/{function_name}_coverage.json"
+    # Map the actual run-scoped artifact paths into the project mount.
+    output_path = coverage_result_path(framework, example, function_name)
+    ctr_test_input = f"{mnt}/{ti_path.relative_to(PROJECT_ROOT)}"
+    ctr_output = f"{mnt}/{output_path.relative_to(PROJECT_ROOT)}"
 
     # Build docker command
+    container_name = f"praxis-coverage-{os.getpid()}-{uuid4().hex[:12]}"
     docker_cmd = [
         "docker", "run", "--rm",
+        "--name", container_name,
         "-v", f"{host_root}:{mnt}",
     ]
+    overlay = _coverage_python_overlay(framework, example)
+    if overlay is not None:
+        ctr_overlay = f"{mnt}/{overlay.relative_to(PROJECT_ROOT.resolve())}"
+        docker_cmd[3:3] = ["-e", f"PYTHONPATH={ctr_overlay}"]
+    runtime = _coverage_docker_runtime()
+    if runtime:
+        docker_cmd[3:3] = ["--runtime", runtime]
 
     # GPU passthrough for CUDA-based images (verl / open-r1) — optional.
     # Checks once per image. When GPU is unavailable, force CPU mode to avoid
     # CUDA initialization hangs during torch import.
     if framework in ("verl", "open-r1"):
-        if _gpu_ready(image):
+        if _coverage_docker_gpus_enabled() and _gpu_ready(image):
             docker_cmd.extend(["--gpus", "all"])
         else:
             # Force CPU — prevents torch from trying to init CUDA (slow/hang)
@@ -190,6 +489,7 @@ def run_coverage_single(
         docker_cmd.append("--capture-output")
 
     # Native execution: bypass Docker, run coverage_runner.py directly on host
+    exec_env = None
     if native:
         import sys as _sys
         runner_path = SCRIPTS_DIR / "koco_openhands" / "memory" / "observed_memory" / "coverage_runner.py"
@@ -210,23 +510,60 @@ def run_coverage_single(
             exec_cmd.append("--per-test")
         if capture_output:
             exec_cmd.append("--capture-output")
+        if overlay is not None:
+            exec_env = os.environ.copy()
+            existing_pythonpath = exec_env.get("PYTHONPATH", "")
+            exec_env["PYTHONPATH"] = str(overlay) + (
+                os.pathsep + existing_pythonpath
+                if existing_pythonpath
+                else ""
+            )
     else:
         exec_cmd = docker_cmd
 
     print(f"  Running coverage for {function_name} (timeout={timeout}s)...")
     try:
-        proc = subprocess.run(exec_cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        print(f"  TIMEOUT {function_name}: exceeded {timeout}s, skipping")
-        _save_error_coverage(framework, example, function_name,
-                             f"Coverage measurement timed out after {timeout}s")
-        return {
-            "function_name": function_name,
-            "line_coverage": None,
-            "num_execution_errors": 1,
-            "execution_errors": [{"error": f"Timed out after {timeout}s", "category": "timeout"}],
-            "is_execution_failure": True,
-        }
+        try:
+            proc = subprocess.run(
+                exec_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=exec_env,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"  TIMEOUT {function_name}: exceeded {timeout}s, skipping")
+            data = {
+                "function_name": function_name,
+                "line_coverage": 0.0,
+                "num_covered_lines": 0,
+                "total_executable_lines": 0,
+                "covered_lines": [],
+                "missing_lines": [],
+                "num_execution_errors": 1,
+                "execution_errors": [{"error": f"Timed out after {timeout}s", "category": "timeout"}],
+                "is_execution_failure": True,
+            }
+            return _save_coverage_data(
+                framework,
+                example,
+                function_name,
+                data,
+                test_input=ti_path,
+                source_file=source_path,
+                target_signature=target_signature,
+                per_test=per_test,
+                capture_output=capture_output,
+                native=native,
+            )
+    finally:
+        if not native:
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
 
     if proc.stdout:
         for line in proc.stdout.strip().splitlines():
@@ -240,22 +577,74 @@ def run_coverage_single(
                 print(f"    {line}")
             stderr_tail = "\n".join(proc.stderr.strip().splitlines()[-30:])
         # Save error-only coverage JSON so failures remain visible in results.
-        _save_error_coverage(framework, example, function_name, stderr_tail)
-        return {
+        data = {
             "function_name": function_name,
-            "line_coverage": None,
+            "line_coverage": 0.0,
+            "num_covered_lines": 0,
+            "total_executable_lines": 0,
+            "covered_lines": [],
+            "missing_lines": [],
             "num_execution_errors": 1,
             "execution_errors": [{"error": stderr_tail, "category": "execution_failure"}],
             "is_execution_failure": True,
         }
+        return _save_coverage_data(
+            framework,
+            example,
+            function_name,
+            data,
+            test_input=ti_path,
+            source_file=source_path,
+            target_signature=target_signature,
+            per_test=per_test,
+            capture_output=capture_output,
+            native=native,
+        )
 
     # Read result
     out_path = coverage_result_path(framework, example, function_name)
     if not out_path.exists():
         print(f"  FAIL {function_name}: output not created")
-        return None
+        data = {
+            "function_name": function_name,
+            "line_coverage": 0.0,
+            "num_covered_lines": 0,
+            "total_executable_lines": 0,
+            "covered_lines": [],
+            "missing_lines": [],
+            "num_execution_errors": 1,
+            "execution_errors": [{
+                "error": "Coverage runner did not create output",
+                "category": "execution_failure",
+            }],
+            "is_execution_failure": True,
+        }
+        return _save_coverage_data(
+            framework,
+            example,
+            function_name,
+            data,
+            test_input=ti_path,
+            source_file=source_path,
+            target_signature=target_signature,
+            per_test=per_test,
+            capture_output=capture_output,
+            native=native,
+        )
 
     data = json.loads(out_path.read_text(encoding="utf-8"))
+    data = _save_coverage_data(
+        framework,
+        example,
+        function_name,
+        data,
+        test_input=ti_path,
+        source_file=source_path,
+        target_signature=target_signature,
+        per_test=per_test,
+        capture_output=capture_output,
+        native=native,
+    )
     lc = data.get("line_coverage", 0)
     n_cov = data.get("num_covered_lines", "?")
     n_tot = data.get("total_executable_lines", "?")
@@ -277,6 +666,8 @@ def run_coverage(
     capture_output: bool = True,
     timeout: int = 120,
     native: bool = False,
+    resume: bool = False,
+    concurrency: int = 1,
 ) -> list[dict]:
     """Run coverage for all (or one) candidate functions in an example.
 
@@ -284,6 +675,8 @@ def run_coverage(
         native: If True, run coverage_runner.py directly on host instead of
             inside Docker. Useful when Docker is unavailable or when running
             on a GPU instance that already has all dependencies installed.
+        resume: Reuse successful coverage whose inputs have not changed.
+        concurrency: Maximum number of independent functions to measure at once.
     """
     cands_path = candidates_path(framework, example)
     if not cands_path.exists():
@@ -297,20 +690,139 @@ def run_coverage(
         if not candidates:
             print(f"Function '{function_name}' not found in candidates.json")
             return []
+    else:
+        runnable = []
+        missing = []
+        for c in candidates:
+            fn = c["function_name"]
+            ti_path = _existing_test_input_path(framework, example, fn)
+            if ti_path is not None:
+                runnable.append(c)
+            else:
+                missing.append(fn)
+        if missing:
+            print(
+                "  WARN: coverage will skip "
+                f"{len(missing)}/{len(candidates)} candidate(s) without test_input.py: "
+                f"{', '.join(missing[:10])}"
+            )
+        candidates = runnable
 
     # Load correct line ranges from JSONL once
     gt_locations = _load_gt_locations_from_jsonl(framework, example)
     if gt_locations:
         print(f"  Loaded {len(gt_locations)} GT locations from JSONL")
 
-    results = []
+    reusable = {}
+    pending = []
     for c in candidates:
         fn = c["function_name"]
-        data = run_coverage_single(
+        if not resume or per_test:
+            pending.append(c)
+            continue
+
+        ti_path = _existing_test_input_path(framework, example, fn)
+        entry = gt_locations.get(fn)
+        if entry:
+            source_file, line_start, line_end = entry[0], entry[1], entry[2]
+            resolved_name = entry[3] if len(entry) > 3 else fn
+        else:
+            source_file, line_start, line_end = _parse_location(
+                c["implementation_location"]
+            )
+            resolved_name = fn
+        source_path = code_dir(framework, example) / source_file
+        runner_path = Path(__file__).with_name("coverage_runner.py")
+        if (
+            ti_path is None
+            or not source_path.is_file()
+            or not runner_path.is_file()
+        ):
+            pending.append(c)
+            continue
+
+        target_signature = (
+            f"{source_file}:{line_start}-{line_end}:{resolved_name}"
+        )
+        fingerprint = _coverage_fingerprint(
+            test_input=ti_path,
+            source_file=source_path,
+            runner_file=runner_path,
+            implementation_location=target_signature,
+            per_test=per_test,
+            capture_output=capture_output,
+            execution_context=_coverage_execution_context(
+                framework,
+                native,
+                example=example,
+            ),
+        )
+        data = _load_reusable_coverage(
+            coverage_result_path(framework, example, fn),
+            dependencies=[cands_path, ti_path, source_path, runner_path],
+            fingerprint=fingerprint,
+        )
+        if (
+            data is None
+            and coverage_result_path(framework, example, fn).is_file()
+        ):
+            try:
+                failed_data = json.loads(
+                    coverage_result_path(
+                        framework,
+                        example,
+                        fn,
+                    ).read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                failed_data = None
+            if (
+                isinstance(failed_data, dict)
+                and failed_data.get("is_execution_failure")
+                and failed_data.get("_praxis_coverage", {}).get("fingerprint")
+                == fingerprint
+                and _feedback_accepts_failed_coverage(
+                    framework,
+                    example,
+                    fn,
+                    failed_data,
+                )
+            ):
+                data = failed_data
+        if data is None:
+            pending.append(c)
+            continue
+        reusable[fn] = data
+        label = "terminal failed" if data.get("is_execution_failure") else "successful"
+        print(f"  SKIP {fn}: reusable {label} coverage")
+
+    def _run(candidate):
+        fn = candidate["function_name"]
+        return fn, run_coverage_single(
             framework, example, fn, per_test, capture_output,
             gt_locations=gt_locations, timeout=timeout,
             native=native,
         )
+
+    measured = {}
+    workers = max(1, concurrency)
+    if workers == 1:
+        for candidate in pending:
+            fn, data = _run(candidate)
+            if data:
+                measured[fn] = data
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_run, candidate): candidate for candidate in pending}
+            for future in as_completed(futures):
+                fn, data = future.result()
+                if data:
+                    measured[fn] = data
+
+    results = []
+    for candidate in candidates:
+        fn = candidate["function_name"]
+        data = reusable.get(fn) or measured.get(fn)
         if data:
             results.append(data)
 

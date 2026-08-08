@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from memory.config import GRAPH_KNOWLEDGE_DIR, code_dir, dep_graph_path
+from memory.config import GRAPH_KNOWLEDGE_DIR, SCRIPTS_DIR, code_dir, dep_graph_path
 
 
 SCHEMA = "DEP_GRAPH_KNOWLEDGE_MOUNT_V1"
@@ -127,9 +127,129 @@ def read_node_source(node: dict[str, Any], source_root: Path | None) -> tuple[st
     return "\n".join(lines[start - 1:end]), None
 
 
-def attach_node_source_code(nodes: list[dict[str, Any]], source_root: Path | None) -> None:
+def _benchmark_target_ranges(
+    framework: str | None,
+    project: str | None,
+) -> dict[str, list[tuple[int, int]]]:
+    if not framework or not project:
+        return {}
+    data_file = (
+        SCRIPTS_DIR
+        / "data"
+        / framework
+        / f"algorithm_methods_data_{project}.jsonl"
+    )
+    if not data_file.exists():
+        return {}
+    from runner import _collect_gt_locations, load_jsonl
+
+    return _collect_gt_locations(load_jsonl(str(data_file)))
+
+
+TARGET_SOURCE_REDACTION_MARKER = "# BENCHMARK TARGET SOURCE HIDDEN"
+
+
+def _overlapping_target_ranges(
+    node: dict[str, Any],
+    target_ranges: dict[str, list[tuple[int, int]]],
+) -> list[tuple[int, int]]:
+    file_path = normalize_source_file_path(node.get("file_path"))
+    try:
+        start = int(node.get("lineno") or 0)
+        end = int(node.get("end_lineno") or start)
+    except (TypeError, ValueError):
+        return []
+    return [
+        (target_start, target_end)
+        for target_start, target_end in target_ranges.get(file_path, [])
+        if start <= target_end and target_start <= end
+    ]
+
+
+def _redact_source_ranges(
+    source_code: str,
+    node_start_line: int,
+    target_ranges: list[tuple[int, int]],
+) -> tuple[str, bool]:
+    """Redact target line ranges from a node-local source snippet."""
+
+    if not source_code or not target_ranges:
+        return source_code, False
+
+    lines = source_code.splitlines()
+    changed = False
+    for target_start, target_end in sorted(target_ranges, reverse=True):
+        first_index = max(0, target_start - node_start_line)
+        last_index = min(len(lines), target_end - node_start_line + 1)
+        if first_index >= last_index:
+            continue
+        indent = len(lines[first_index]) - len(lines[first_index].lstrip())
+        lines[first_index] = f"{' ' * indent}{TARGET_SOURCE_REDACTION_MARKER}"
+        for index in range(first_index + 1, last_index):
+            lines[index] = ""
+        changed = True
+    return "\n".join(lines), changed
+
+
+def _has_non_redacted_source(source_code: str) -> bool:
+    for line in source_code.splitlines():
+        stripped = line.strip()
+        if stripped and stripped != TARGET_SOURCE_REDACTION_MARKER:
+            return True
+    return False
+
+
+def attach_node_source_code(
+    nodes: list[dict[str, Any]],
+    source_root: Path | None,
+    target_ranges: dict[str, list[tuple[int, int]]] | None = None,
+) -> None:
+    target_ranges = target_ranges or {}
     for node in nodes:
+        overlapping_ranges = _overlapping_target_ranges(node, target_ranges)
+        if overlapping_ranges:
+            try:
+                start = int(node.get("lineno") or 0)
+                end = int(node.get("end_lineno") or start)
+            except (TypeError, ValueError):
+                start = end = 0
+            if any(start == target_start and end == target_end for target_start, target_end in overlapping_ranges):
+                node["source_code"] = ""
+                node["source_code_error"] = "benchmark_target_hidden"
+                node["benchmark_target_hidden"] = True
+                node["benchmark_target_mask"] = "full"
+                continue
+
         source_code, source_error = read_node_source(node, source_root)
+        if overlapping_ranges and not source_error:
+            try:
+                start = int(node.get("lineno") or 0)
+            except (TypeError, ValueError):
+                start = 0
+            redacted_source, changed = _redact_source_ranges(
+                source_code,
+                start,
+                overlapping_ranges,
+            )
+            if changed:
+                if not _has_non_redacted_source(redacted_source):
+                    node["source_code"] = ""
+                    node["source_code_error"] = "benchmark_target_hidden"
+                    node["benchmark_target_hidden"] = True
+                    node["benchmark_target_mask"] = "full"
+                    continue
+                node["source_code"] = redacted_source
+                node["benchmark_target_hidden"] = True
+                node["benchmark_target_mask"] = "partial"
+                node["source_code_error"] = "benchmark_target_partially_hidden"
+                continue
+
+        if overlapping_ranges:
+            node["source_code"] = ""
+            node["source_code_error"] = "benchmark_target_hidden"
+            node["benchmark_target_hidden"] = True
+            node["benchmark_target_mask"] = "full"
+            continue
         node["source_code"] = source_code
         if source_error:
             node["source_code_error"] = source_error
@@ -137,7 +257,11 @@ def attach_node_source_code(nodes: list[dict[str, Any]], source_root: Path | Non
             node.pop("source_code_error", None)
 
 
-def parse_graph(graph_path: str | Path, source_root: Path | None = None) -> GraphIndex:
+def parse_graph(
+    graph_path: str | Path,
+    source_root: Path | None = None,
+    target_ranges: dict[str, list[tuple[int, int]]] | None = None,
+) -> GraphIndex:
     """Parse a dependency graph and build stable node indexes."""
 
     graph_path = Path(graph_path)
@@ -159,7 +283,7 @@ def parse_graph(graph_path: str | Path, source_root: Path | None = None) -> Grap
         nodes_by_name[str(normalized.get("name", ""))].append(normalized)
         if normalized.get("qualified_name"):
             nodes_by_qualified_name[str(normalized["qualified_name"])] = normalized
-    attach_node_source_code(nodes, source_root)
+    attach_node_source_code(nodes, source_root, target_ranges=target_ranges)
 
     edges_by_node_key = [
         normalize_edge(edge, nodes_by_id, nodes_by_key)
@@ -778,7 +902,12 @@ def build_knowledge_mount(
         project=project,
         source_root=source_root,
     )
-    graph = parse_graph(graph_path, source_root=resolved_source_root)
+    target_ranges = _benchmark_target_ranges(framework, project)
+    graph = parse_graph(
+        graph_path,
+        source_root=resolved_source_root,
+        target_ranges=target_ranges,
+    )
     knowledge_items = parse_knowledge_root(
         knowledge_root,
         framework=framework,
@@ -826,6 +955,15 @@ def build_knowledge_mount(
             "num_mounts": len(mounts),
             "num_unmounted_function_scoped_items": len(unmounted),
             "num_nodes_with_source_code": sum(1 for node in graph.nodes if node.get("source_code")),
+            "num_hidden_benchmark_target_nodes": sum(
+                1 for node in graph.nodes if node.get("benchmark_target_hidden")
+            ),
+            "num_partially_hidden_benchmark_target_nodes": sum(
+                1 for node in graph.nodes if node.get("benchmark_target_mask") == "partial"
+            ),
+            "num_fully_hidden_benchmark_target_nodes": sum(
+                1 for node in graph.nodes if node.get("benchmark_target_mask") == "full"
+            ),
         },
         "nodes": graph.nodes,
         "edges": graph.edges_by_node_key,
@@ -865,6 +1003,11 @@ def main() -> None:
         ),
     )
     parser.add_argument("--output", type=Path, help="Output JSON path")
+    parser.add_argument(
+        "--require-knowledge",
+        action="store_true",
+        help="Fail if no knowledge is loaded or no function-scoped item is mounted.",
+    )
     args = parser.parse_args()
 
     if args.graph_path:
@@ -884,6 +1027,15 @@ def main() -> None:
         knowledge_profile=args.knowledge_profile,
         source_root=args.source_root,
     )
+    stats = artifact["stats"]
+    if args.require_knowledge and (
+        stats["num_knowledge_items"] <= 0 or stats["num_mounts"] <= 0
+    ):
+        raise RuntimeError(
+            "No usable knowledge was mounted: "
+            f"items={stats['num_knowledge_items']} mounts={stats['num_mounts']} "
+            f"unmounted={stats['num_unmounted_function_scoped_items']}"
+        )
 
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(artifact, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -5,6 +5,8 @@ results/
 *.log
 praxis/domain_code_generation/scripts/koco_openhands/run_logs/
 praxis/domain_code_generation/scripts/koco_openhands/memory/derived/
+praxis/domain_code_generation/scripts/koco_openhands/.cache/
+*.coverage
 
 # Environment variables
 .env

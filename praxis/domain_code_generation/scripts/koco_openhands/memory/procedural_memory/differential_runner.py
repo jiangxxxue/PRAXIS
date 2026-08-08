@@ -321,10 +321,15 @@ def _ensure_parent_packages(source_dir: str, dotted: str) -> None:
 
 def _load_test_input(test_input_path: str):
     """Import test_input.py and return (module, test_cases, get_callable_or_None)."""
+    import unittest.mock
+
     spec = importlib.util.spec_from_file_location(
         "_pilot_test_input", test_input_path
     )
     module = importlib.util.module_from_spec(spec)
+    module.MagicMock = unittest.mock.MagicMock
+    module.AsyncMock = unittest.mock.AsyncMock
+    module.mock = unittest.mock
     spec.loader.exec_module(module)
     test_cases = getattr(module, "test_cases", None)
     if not isinstance(test_cases, dict):

@@ -314,6 +314,14 @@ def cmd_practice(args):
     print(f"practice: ran {ran}/{args.K} iterations{early} — "
           f"{trace['non_empty_count']}/{ran} non-empty, {passed}/{ran} passed")
     print(f"practice: wrote trace → {trace_path}")
+    usable = [
+        it for it in trace["iterations"]
+        if it.get("completion") and not it.get("grade", {}).get("infra_failure")
+    ]
+    if not usable:
+        raise RuntimeError(
+            f"practice produced no usable attempt for {spec['function_name']}"
+        )
 
 
 def cmd_distill_structured(args):
@@ -323,7 +331,7 @@ def cmd_distill_structured(args):
     print(f"distill-structured: reading trace → {trace_path} "
           f"({len(trace.get('iterations', []))} iterations)")
     print(f"distill-structured: calling provider={args.provider} model={args.model} ...")
-    distill_structured_trace(
+    entries = distill_structured_trace(
         trace,
         model=args.model,
         api_key=args.api_key,
@@ -331,6 +339,10 @@ def cmd_distill_structured(args):
         provider=args.provider,
         api_version=args.api_version,
     )
+    if not entries:
+        raise RuntimeError(
+            f"distill-structured produced no knowledge for {spec['function_name']}"
+        )
 
 
 def cmd_consolidate_structured(args):

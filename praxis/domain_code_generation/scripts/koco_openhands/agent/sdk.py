@@ -80,7 +80,8 @@ def _stuck_detection_config() -> tuple[bool, dict[str, int]]:
 def run_sdk_agent(prompt, workspace, model, api_key, base_url,
                   max_iterations=50, corpus_dirs=None,
                   graph_knowledge_path=None,
-                  graph_knowledge_format="trigger_content"):
+                  graph_knowledge_format="trigger_content",
+                  graph_knowledge_min_confidence=None):
     """Run the OpenHands SDK agent and return (events, status).
 
     Creates an ephemeral LLM → Agent → Conversation pipeline, sends
@@ -95,6 +96,8 @@ def run_sdk_agent(prompt, workspace, model, api_key, base_url,
             graph knowledge for surfaced code locations.
         graph_knowledge_format: Formatting mode for graph knowledge shown to
             the agent.
+        graph_knowledge_min_confidence: Minimum confidence score injected into
+            prompts and tool observations.
 
     Returns:
         (events, status) where *events* is a list of SDK event objects and
@@ -132,10 +135,12 @@ def run_sdk_agent(prompt, workspace, model, api_key, base_url,
             "terminal_type": "subprocess",
             "graph_knowledge_path": str(graph_knowledge_path),
             "graph_knowledge_format": graph_knowledge_format,
+            "graph_knowledge_min_confidence": graph_knowledge_min_confidence,
         }
         file_editor_params = {
             "graph_knowledge_path": str(graph_knowledge_path),
             "graph_knowledge_format": graph_knowledge_format,
+            "graph_knowledge_min_confidence": graph_knowledge_min_confidence,
         }
 
     tools_list = [
@@ -144,7 +149,19 @@ def run_sdk_agent(prompt, workspace, model, api_key, base_url,
     ]
     if corpus_dirs:
         import tools.knowledge_search  # noqa: F401 — triggers register_tool()
-        tools_list.append(Tool(name="knowledge_search", params={"corpus_dirs": corpus_dirs}))
+        tools_list.append(Tool(
+            name="knowledge_search",
+            params={
+                "corpus_dirs": corpus_dirs,
+                "graph_knowledge_path": (
+                    str(graph_knowledge_path)
+                    if graph_knowledge_path
+                    else None
+                ),
+                "graph_knowledge_format": graph_knowledge_format,
+                "graph_knowledge_min_confidence": graph_knowledge_min_confidence,
+            },
+        ))
 
     agent = Agent(
         llm=llm,

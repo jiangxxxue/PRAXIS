@@ -20,6 +20,7 @@ from openhands.sdk.tool import (
 )
 from openhands.sdk.tool.schema import TextContent
 
+from tools._graph_knowledge_inject import inject_for_locations, make_graph_retriever
 from tools.knowledge_search.hybrid import (
     extract_keywords,
     merge_hybrid_results,
@@ -84,10 +85,22 @@ TEXT_WEIGHT = 0.3
 class KnowledgeSearchExecutor(ToolExecutor[KnowledgeSearchAction, KnowledgeSearchObservation]):
     """Orchestrates hybrid search (port of OpenClaw's manager.search())."""
 
-    def __init__(self, corpus_dirs: str | list[str] = ""):
+    def __init__(
+        self,
+        corpus_dirs: str | list[str] = "",
+        graph_knowledge_path: str | None = None,
+        graph_knowledge_format: str = "trigger_content",
+        graph_knowledge_min_confidence: float | None = None,
+    ):
         self.index = SearchIndex()
         if corpus_dirs:
             self.index.build(corpus_dirs)
+        self.graph_retriever = make_graph_retriever(
+            graph_knowledge_path,
+            min_confidence=graph_knowledge_min_confidence,
+        )
+        self.graph_knowledge_format = graph_knowledge_format
+        self._seen_node_keys: set[str] = set()
 
     def __call__(
         self,
@@ -117,6 +130,24 @@ class KnowledgeSearchExecutor(ToolExecutor[KnowledgeSearchAction, KnowledgeSearc
                 r["snippet"] = r["snippet"][:SNIPPET_MAX_CHARS] + "..."
 
         formatted = _format_results(results, query)
+        graph_formatted, _ = inject_for_locations(
+            self.graph_retriever,
+            [
+                {
+                    "path": result["path"],
+                    "start_line": result["start_line"],
+                    "end_line": result["end_line"],
+                }
+                for result in results
+            ],
+            title="GRAPH KNOWLEDGE FOR SEARCH RESULTS:",
+            max_nodes=3,
+            max_items_per_node=3,
+            knowledge_format=self.graph_knowledge_format,
+            seen_node_keys=self._seen_node_keys,
+        )
+        if graph_formatted:
+            formatted += "\n\n" + graph_formatted
 
         return KnowledgeSearchObservation(
             content=[TextContent(text=formatted)],
@@ -230,9 +261,17 @@ class KnowledgeSearchTool(ToolDefinition[KnowledgeSearchAction, KnowledgeSearchO
         cls,
         conv_state: "ConversationState | None" = None,
         corpus_dirs: str | list[str] = "",
+        graph_knowledge_path: str | None = None,
+        graph_knowledge_format: str = "trigger_content",
+        graph_knowledge_min_confidence: float | None = None,
         **kwargs,
     ) -> Sequence["KnowledgeSearchTool"]:
-        executor = KnowledgeSearchExecutor(corpus_dirs=corpus_dirs)
+        executor = KnowledgeSearchExecutor(
+            corpus_dirs=corpus_dirs,
+            graph_knowledge_path=graph_knowledge_path,
+            graph_knowledge_format=graph_knowledge_format,
+            graph_knowledge_min_confidence=graph_knowledge_min_confidence,
+        )
         return [cls(
             description=TOOL_DESCRIPTION,
             action_type=KnowledgeSearchAction,

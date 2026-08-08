@@ -39,6 +39,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import threading
@@ -66,6 +67,25 @@ from config import (
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
+
+_SUCCESS_STATUSES = {"success"}
+
+
+def _safe_run_component(value: str) -> str:
+    value = value.strip().replace("/", "__")
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+    return value.strip("._") or "default"
+
+
+def _model_dir_name(model: str) -> str:
+    return _safe_run_component(model)
+
+
+def _run_dir_name(model: str, run_name: str = "") -> str:
+    model_name = _model_dir_name(model)
+    if not run_name:
+        return model_name
+    return f"{model_name}--{_safe_run_component(run_name)}"
 
 def _ensure_input_data(framework: str, example: str) -> bool:
     """Run Step 1 (parse) + Step 2 (prompts) for a single test example.
@@ -129,6 +149,8 @@ def cmd_infer(
     debug: bool = False,
     graph_knowledge_profile: str = "",
     graph_knowledge_artifact: str = "auto",
+    graph_knowledge_min_confidence: float | None = None,
+    run_name: str = "",
 ) -> int:
     """Run OpenHands agent inference for code generation.
 
@@ -147,23 +169,13 @@ def cmd_infer(
         save_completed_ids,
     )
 
-    # Resolve API key: arg > env > .env file
-    if not api_key:
-        api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
-        env_file = SCRIPTS_DIR / ".env"
-        if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                line = line.strip()
-                if line.startswith("OPENROUTER_API_KEY="):
-                    api_key = line.split("=", 1)[1].strip()
-                    break
+    api_key = _resolve_api_key(api_key)
     if not api_key:
         print("\nERROR: OPENROUTER_API_KEY is not set.")
         print("Set it via --api-key, export OPENROUTER_API_KEY=..., or in scripts/.env")
         return 1
 
-    model_dir_name = model.split("/")[-1]
+    model_dir_name = _run_dir_name(model, run_name)
     examples = [test_example] if test_example else get_test_examples(framework)
 
     success, fail = 0, 0
@@ -223,16 +235,24 @@ def cmd_infer(
             records = [r for r in records if r["function_name"] in instance_ids]
             print(f"  Filtered to {len(records)} by --instance-ids")
 
-        # Resume support
-        completed = load_completed_ids(str(progress_file))
-        if completed:
-            print(f"  Resuming: {len(completed)} already completed")
-
         # Load existing output (for incremental append)
         existing = {}
         if output_file.exists():
             for r in load_jsonl(str(output_file)):
                 existing[r["function_name"]] = r
+
+        # Resume only genuinely successful records. This also repairs progress
+        # files written by older versions that marked failed attempts complete.
+        completed = load_completed_ids(str(progress_file))
+        successful_existing = {
+            function_name
+            for function_name, result in existing.items()
+            if result.get("status") in _SUCCESS_STATUSES
+        }
+        completed.intersection_update(successful_existing)
+        if completed:
+            print(f"  Resuming: {len(completed)} already completed")
+        save_completed_ids(completed, str(progress_file))
 
         pending = [r for r in records if r["function_name"] not in completed]
 
@@ -261,31 +281,45 @@ def cmd_infer(
                 debug=debug,
                 graph_knowledge_profile=graph_knowledge_profile,
                 graph_knowledge_artifact=graph_knowledge_artifact,
+                graph_knowledge_min_confidence=graph_knowledge_min_confidence,
                 output_dir=str(output_dir),
             )
             with lock:
                 existing[result["function_name"]] = result
-                completed.add(result["function_name"])
-                save_completed_ids(completed, str(progress_file))
                 save_jsonl(list(existing.values()), str(output_file))
+                if result.get("status") in _SUCCESS_STATUSES:
+                    completed.add(result["function_name"])
+                else:
+                    completed.discard(result["function_name"])
+                save_completed_ids(completed, str(progress_file))
             return result
 
+        statuses = []
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_process_one, r): r for r in pending}
             for future in as_completed(futures):
                 r = future.result()
+                statuses.append(r.get("status", "error"))
                 print(f"  [{r['function_name']}] done -> {r['status']}")
 
         print(f"  Saved {len(existing)} results -> {output_file.name}")
-        success += 1
+        if any(status not in _SUCCESS_STATUSES for status in statuses):
+            fail += 1
+        else:
+            success += 1
 
     print(f"\nInference summary: {success} example(s) processed, {fail} failed")
-    return 0
+    return 1 if fail else 0
 
 
 # ── eval (reuses cli.py steps 4-5) ───────────────────────────────────────
 
-def cmd_eval(framework: str, model: str, test_example: str = None) -> int:
+def cmd_eval(
+    framework: str,
+    model: str,
+    test_example: str = None,
+    run_name: str = "",
+) -> int:
     """Run Docker evaluation + aggregate metrics.
 
     Reads inference output from the openhands/ subdirectory, runs
@@ -297,7 +331,7 @@ def cmd_eval(framework: str, model: str, test_example: str = None) -> int:
     """
     from aggregate_metrics import main as agg_main
 
-    model_dir_name = model.split("/")[-1]
+    model_dir_name = _run_dir_name(model, run_name)
     # Correct path: scripts/data/{framework}/openhands/{model_dir_name}
     data_subdir = f"scripts/data/{framework}/openhands/{model_dir_name}"
 
@@ -338,7 +372,8 @@ def cmd_eval(framework: str, model: str, test_example: str = None) -> int:
 
         host_input = PROJECT_ROOT / data_subdir / input_name
         if not host_input.exists():
-            print(f"  {example}: SKIP (input file not found)")
+            print(f"  {example}: FAIL (input file not found)")
+            failed += 1
             continue
 
         docker_cmd = [
@@ -397,6 +432,8 @@ def cmd_eval(framework: str, model: str, test_example: str = None) -> int:
             "--model_dir", str(model_dir),
             "--framework", framework,
         ]
+        if test_example:
+            sys.argv.extend(["--test_examples", test_example])
         try:
             rc = agg_main()
             agg_rc = rc if rc is not None else 0
@@ -436,7 +473,12 @@ def cmd_run(
         return 1
 
     print("\n>>> Phase 2: Evaluation")
-    rc2 = cmd_eval(framework, model, test_example)
+    rc2 = cmd_eval(
+        framework,
+        model,
+        test_example,
+        run_name=infer_kwargs.get("run_name", ""),
+    )
     return rc2
 
 
@@ -456,6 +498,10 @@ def _resolve_api_key(api_key: str) -> str:
             if line.startswith("OPENROUTER_API_KEY="):
                 return line.split("=", 1)[1].strip()
     return ""
+
+
+def _memory_base_url(args) -> str:
+    return getattr(args, "base_url", "") or "https://openrouter.ai/api/v1"
 
 
 def cmd_memory_init(args) -> int:
@@ -478,7 +524,7 @@ def cmd_memory_init(args) -> int:
             example=args.test_example,
             model=args.model,
             api_key=api_key,
-            base_url=getattr(args, "base_url", "https://openrouter.ai/api/v1"),
+            base_url=_memory_base_url(args),
             max_iterations=getattr(args, "max_iterations", 100),
         )
         print(f"\nObserved memory: {out}")
@@ -518,7 +564,7 @@ def cmd_memory_select(args) -> int:
             example=args.test_example,
             model=args.model,
             api_key=api_key,
-            base_url=getattr(args, "base_url", "https://openrouter.ai/api/v1"),
+            base_url=_memory_base_url(args),
             max_iterations=getattr(args, "max_iterations", 100),
             strategy=args.strategy,
             top_k=getattr(args, "top_k", None),
@@ -551,13 +597,21 @@ def cmd_memory_generate(args) -> int:
             example=args.test_example,
             model=args.model,
             api_key=api_key,
-            base_url=getattr(args, "base_url", "https://openrouter.ai/api/v1"),
+            base_url=_memory_base_url(args),
             max_iterations=getattr(args, "max_iterations", 100),
+            terminal_max_iterations=getattr(
+                args,
+                "terminal_max_iterations",
+                None,
+            ),
             concurrency=getattr(args, "concurrency", 1),
             debug=getattr(args, "debug", False),
             force=getattr(args, "force", False),
         )
         print(f"\nGenerated for {len(results)} functions")
+        if not getattr(results, "complete", False):
+            print("\nERROR: generate has retryable function failures")
+            return 1
         cands_path = candidates_path(args.framework, args.test_example)
         candidates = json.loads(cands_path.read_text(encoding="utf-8"))
         missing = [
@@ -565,12 +619,17 @@ def cmd_memory_generate(args) -> int:
             for c in candidates
             if not test_input_path(args.framework, args.test_example, c["function_name"]).exists()
         ]
+        generated = len(candidates) - len(missing)
         if missing:
+            label = "ERROR" if generated == 0 else "WARN"
             print(
-                "\nERROR: test_input.py missing for "
+                f"\n{label}: test_input.py missing for "
                 f"{len(missing)}/{len(candidates)} candidate(s): {', '.join(missing[:10])}"
             )
-            return 1
+            print(
+                f"Continuing with {generated}/{len(candidates)} generated "
+                "test_input.py file(s)."
+            )
         return 0
     except Exception as exc:
         print(f"\nERROR: {exc}")
@@ -597,8 +656,27 @@ def cmd_memory_coverage(args) -> int:
             capture_output=not no_output,
             timeout=getattr(args, "timeout", 120),
             native=getattr(args, "native", False),
+            resume=getattr(args, "resume", False),
+            concurrency=getattr(args, "concurrency", 1),
         )
-        return 0 if results else 1
+        if not results:
+            if getattr(args, "allow_empty", False):
+                print("\nWARN: no runnable generated test inputs; coverage is empty")
+                return 0
+            return 1
+        failures = [r for r in results if r.get("is_execution_failure")]
+        if failures and not getattr(args, "allow_execution_failures", False):
+            print(
+                f"\nERROR: coverage execution failed for {len(failures)}/"
+                f"{len(results)} function(s)"
+            )
+            return 1
+        if failures:
+            print(
+                f"\nWARN: preserving {len(failures)} coverage failure(s) for "
+                "the feedback stage"
+            )
+        return 0
     except Exception as exc:
         print(f"\nERROR: {exc}")
         return 1
@@ -606,6 +684,7 @@ def cmd_memory_coverage(args) -> int:
 
 def cmd_memory_feedback(args) -> int:
     from memory.observed_memory.regenerate import run_feedback_loop
+    from memory.observed_memory.quality import coverage_ready
 
     api_key = _resolve_api_key(getattr(args, "api_key", ""))
     if not api_key:
@@ -626,17 +705,69 @@ def cmd_memory_feedback(args) -> int:
             example=args.test_example,
             model=args.model,
             api_key=api_key,
-            base_url=getattr(args, "base_url", "https://openrouter.ai/api/v1"),
+            base_url=_memory_base_url(args),
             max_iterations=getattr(args, "max_iterations", 100),
+            terminal_max_iterations=getattr(
+                args,
+                "terminal_max_iterations",
+                None,
+            ),
             coverage_threshold=args.coverage_threshold,
             max_retries=args.max_retries,
+            terminal_max_retries=getattr(
+                args,
+                "terminal_max_retries",
+                None,
+            ),
             function_name=getattr(args, "function_name", None),
             concurrency=getattr(args, "concurrency", 1),
             debug=getattr(args, "debug", False),
+            force=getattr(args, "force", False),
         )
-        # An empty result means all available coverage already meets the
-        # threshold, or no generated test input exists for skipped functions.
-        # The feedback stage still completed successfully in that no-op case.
+        if not getattr(results, "complete", False):
+            print("\nERROR: feedback has retryable function failures")
+            return 1
+        from memory.config import candidates_path, coverage_result_path
+
+        candidates = json.loads(
+            candidates_path(args.framework, args.test_example).read_text(
+                encoding="utf-8"
+            )
+        )
+        if getattr(args, "function_name", None):
+            candidates = [
+                item for item in candidates
+                if item["function_name"] == args.function_name
+            ]
+        ready = []
+        not_ready = []
+        for item in candidates:
+            coverage_path = coverage_result_path(
+                args.framework,
+                args.test_example,
+                item["function_name"],
+            )
+            if not coverage_path.exists():
+                not_ready.append(f"{item['function_name']} (missing)")
+                continue
+            coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
+            line_coverage = float(coverage.get("line_coverage") or 0.0)
+            if not coverage_ready(coverage, args.coverage_threshold):
+                not_ready.append(
+                    f"{item['function_name']} ({line_coverage:.1%})"
+                )
+            else:
+                ready.append(item["function_name"])
+        if not ready:
+            print(
+                "\nWARN: feedback produced no function that meets the coverage "
+                f"threshold; unresolved: {', '.join(not_ready[:10])}"
+            )
+        if not_ready:
+            print(
+                "\nWARN: Stage 2 will exclude functions still below the coverage "
+                f"threshold: {', '.join(not_ready[:10])}"
+            )
         return 0
     except Exception as exc:
         print(f"\nERROR: {exc}")
@@ -688,6 +819,11 @@ def main():
         sp.add_argument("--framework", required=True, help="Framework name (e.g. verl)")
         sp.add_argument("--model", default="deepseek/deepseek-v3.2", help="OpenRouter model (default: deepseek/deepseek-v3.2)")
         sp.add_argument("--test-example", default=None, help="Single test example (default: all)")
+        sp.add_argument(
+            "--run-name",
+            default="",
+            help="Experiment namespace appended to the model output directory.",
+        )
 
     def add_infer_args(sp):
         sp.add_argument("--api-key", default="", help="OpenRouter API key (default: OPENROUTER_API_KEY env)")
@@ -709,6 +845,15 @@ def main():
             help=(
                 "Graph artifact to use: auto prefers optimized then falls back "
                 "to mounted; optimized/mounted require that exact artifact."
+            ),
+        )
+        sp.add_argument(
+            "--graph-knowledge-min-confidence",
+            type=float,
+            default=None,
+            help=(
+                "Minimum confidence for injected graph knowledge. Defaults to "
+                "PRAXIS_CONFIDENCE_THRESHOLD or 0.6."
             ),
         )
 
@@ -747,8 +892,11 @@ def main():
     m_select.add_argument("--max-iterations", type=int, default=100, help="Max agent turns (default: 100)")
     m_select.add_argument(
         "--strategy",
-        default="llm",
-        help="Selection strategy: llm, business_logic, indegree, outdegree, all, or comma-separated",
+        default="business_logic,indegree,outdegree",
+        help=(
+            "Selection strategy: defaults to the union of business_logic, "
+            "indegree, and outdegree; also accepts llm, all, or comma-separated values"
+        ),
     )
     m_select.add_argument("--top-k", type=int, default=None, help="Max candidates for indegree/outdegree")
 
@@ -759,6 +907,12 @@ def main():
     m_generate.add_argument("--api-key", default="", help="OpenRouter API key")
     m_generate.add_argument("--base-url", default="https://openrouter.ai/api/v1", help="API base URL")
     m_generate.add_argument("--max-iterations", type=int, default=100, help="Max agent turns (default: 100)")
+    m_generate.add_argument(
+        "--terminal-max-iterations",
+        type=int,
+        default=None,
+        help="Budget required before a deterministic failure becomes terminal",
+    )
     m_generate.add_argument("--concurrency", "-j", type=int, default=1, help="Concurrent agents (default: 1)")
     m_generate.add_argument("--debug", action="store_true", help="Preserve workspace artifacts for debugging")
     m_generate.add_argument("--force", action="store_true", help="Regenerate even if test_input already exists")
@@ -771,6 +925,28 @@ def main():
     m_coverage.add_argument("--no-output", action="store_true", help="Skip output capture")
     m_coverage.add_argument("--timeout", type=int, default=120, help="Per-function timeout in seconds")
     m_coverage.add_argument("--native", action="store_true", help="Run directly on host instead of Docker")
+    m_coverage.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse successful coverage when the test input and source are unchanged",
+    )
+    m_coverage.add_argument(
+        "--concurrency",
+        "-j",
+        type=int,
+        default=1,
+        help="Concurrent coverage workers (default: 1)",
+    )
+    m_coverage.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="Return success when no candidate has a generated test input",
+    )
+    m_coverage.add_argument(
+        "--allow-execution-failures",
+        action="store_true",
+        help="Return success after recording failures so a following feedback step can repair them.",
+    )
 
     m_feedback = mem_sub.add_parser("feedback", help="Regenerate test_input.py for low-coverage functions")
     m_feedback.add_argument("--framework", required=True, help="Framework name")
@@ -780,10 +956,27 @@ def main():
     m_feedback.add_argument("--api-key", default="", help="OpenRouter API key")
     m_feedback.add_argument("--base-url", default="https://openrouter.ai/api/v1", help="API base URL")
     m_feedback.add_argument("--max-iterations", type=int, default=100, help="Max agent turns (default: 100)")
-    m_feedback.add_argument("--coverage-threshold", type=float, default=0.5, help="Target line coverage 0.0-1.0")
-    m_feedback.add_argument("--max-retries", type=int, default=3, help="Max regeneration attempts per function")
+    m_feedback.add_argument(
+        "--terminal-max-iterations",
+        type=int,
+        default=None,
+        help="Iteration budget required before a deterministic failure becomes terminal",
+    )
+    m_feedback.add_argument("--coverage-threshold", type=float, default=0.8, help="Target line coverage 0.0-1.0")
+    m_feedback.add_argument("--max-retries", type=int, default=1, help="Max regeneration attempts per function")
+    m_feedback.add_argument(
+        "--terminal-max-retries",
+        type=int,
+        default=None,
+        help="Retry budget required before a deterministic failure becomes terminal",
+    )
     m_feedback.add_argument("--concurrency", "-j", type=int, default=1, help="Concurrent agents (default: 1)")
     m_feedback.add_argument("--debug", action="store_true", help="Preserve workspace artifacts for debugging")
+    m_feedback.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore reusable terminal feedback states",
+    )
 
     m_proc = mem_sub.add_parser(
         "procedural",
@@ -794,7 +987,6 @@ def main():
     m_proc.add_argument("procedural_args", nargs=argparse.REMAINDER)
 
     args = parser.parse_args()
-
     if not args.command:
         parser.print_help()
         return 1
@@ -837,6 +1029,8 @@ def main():
             debug=args.debug,
             graph_knowledge_profile=args.graph_knowledge_profile,
             graph_knowledge_artifact=args.graph_knowledge_artifact,
+            graph_knowledge_min_confidence=args.graph_knowledge_min_confidence,
+            run_name=args.run_name,
         )
 
     elif args.command == "eval":
@@ -846,7 +1040,12 @@ def main():
             Model=args.model,
             TestExample=test_example or "all",
         )
-        return cmd_eval(args.framework, args.model, test_example)
+        return cmd_eval(
+            args.framework,
+            args.model,
+            test_example,
+            run_name=getattr(args, "run_name", ""),
+        )
 
     elif args.command == "run":
         _print_banner(
@@ -870,6 +1069,8 @@ def main():
             debug=args.debug,
             graph_knowledge_profile=args.graph_knowledge_profile,
             graph_knowledge_artifact=args.graph_knowledge_artifact,
+            graph_knowledge_min_confidence=args.graph_knowledge_min_confidence,
+            run_name=args.run_name,
         )
 
     return 0

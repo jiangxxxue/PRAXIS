@@ -1,6 +1,7 @@
 """Path configuration for koco_openhands memory artifacts."""
 
 import json
+import os
 from pathlib import Path
 
 KOCO_OPENHANDS_DIR = Path(__file__).resolve().parent.parent
@@ -15,10 +16,15 @@ GRAPH_KNOWLEDGE_DIR = DERIVED_DIR / "graph_knowledge"
 PROCEDURAL_KNOWLEDGE_DIR = DERIVED_DIR / "procedural_knowledge"
 PRACTICE_KNOWLEDGE_DIR = PROCEDURAL_KNOWLEDGE_DIR
 PROMPTS_DIR = MEMORY_DIR / "prompts"
+MEMORY_RUN_ID = os.environ.get("PRAXIS_MEMORY_RUN_ID", "").strip()
+
+
+def _run_scoped(root: Path) -> Path:
+    return root / MEMORY_RUN_ID if MEMORY_RUN_ID else root
 
 
 def observed_knowledge_path(framework: str, example: str) -> Path:
-    return OBSERVED_KNOWLEDGE_DIR / framework / f"{example}.md"
+    return _run_scoped(OBSERVED_KNOWLEDGE_DIR) / framework / f"{example}.md"
 
 
 def static_memory_path(framework: str, example: str) -> Path:
@@ -26,11 +32,11 @@ def static_memory_path(framework: str, example: str) -> Path:
 
 
 def observed_example_dir(framework: str, example: str) -> Path:
-    return OBSERVED_KNOWLEDGE_DIR / framework / example
+    return _run_scoped(OBSERVED_KNOWLEDGE_DIR) / framework / example
 
 
 def graph_knowledge_example_dir(framework: str, example: str) -> Path:
-    return GRAPH_KNOWLEDGE_DIR / framework / example
+    return _run_scoped(GRAPH_KNOWLEDGE_DIR) / framework / example
 
 
 def candidates_path(framework: str, example: str) -> Path:
@@ -51,6 +57,18 @@ def coverage_result_path(framework: str, example: str, function_name: str) -> Pa
 
 def feedback_log_path(framework: str, example: str, function_name: str) -> Path:
     return observed_example_dir(framework, example) / f"{function_name}_feedback_log.json"
+
+
+def generate_status_path(framework: str, example: str, function_name: str) -> Path:
+    return observed_example_dir(framework, example) / f"{function_name}_generate_status.json"
+
+
+def generate_log_path(framework: str, example: str, function_name: str) -> Path:
+    return observed_example_dir(framework, example) / f"{function_name}_generate_log.json"
+
+
+def feedback_status_path(framework: str, example: str, function_name: str) -> Path:
+    return observed_example_dir(framework, example) / f"{function_name}_feedback_status.json"
 
 
 def dep_graph_path(framework: str, example: str) -> Path:

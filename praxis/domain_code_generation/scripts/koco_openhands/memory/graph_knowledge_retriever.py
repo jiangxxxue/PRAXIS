@@ -7,12 +7,22 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from memory.confidence import (
+    configured_confidence_threshold,
+    knowledge_confidence_score,
+)
+
 
 class GraphKnowledgeRetriever:
     """Read ``dep_graph.with_knowledge.json`` and retrieve exact node knowledge."""
 
-    def __init__(self, graph_knowledge_path: str | Path):
+    def __init__(
+        self,
+        graph_knowledge_path: str | Path,
+        min_confidence: float | None = None,
+    ):
         self.path = Path(graph_knowledge_path)
+        self.min_confidence = configured_confidence_threshold(min_confidence)
         self.data = json.loads(self.path.read_text(encoding="utf-8"))
         self.nodes = self.data.get("nodes", [])
         self.edges = self.data.get("edges", [])
@@ -249,13 +259,19 @@ class GraphKnowledgeRetriever:
                 if len(seen_nodes) >= max_nodes:
                     break
 
+        results.sort(
+            key=lambda result: (
+                -knowledge_confidence_score(result["knowledge"]),
+                str(result["knowledge"].get("id") or ""),
+            )
+        )
         return {
             "matched_nodes": matched_nodes,
             "results": results,
         }
 
     def get_node_knowledge(self, node_key: str) -> list[dict[str, Any]]:
-        """Return canonical knowledge plus any newly mounted direct knowledge."""
+        """Return confidence-filtered knowledge sorted from highest to lowest."""
 
         node = self.nodes_by_key.get(node_key)
         if not node:
@@ -285,14 +301,30 @@ class GraphKnowledgeRetriever:
                 for item in knowledge.get("direct", [])
                 if isinstance(item, dict) and item.get("id") not in covered_source_ids
             ]
-            return canonical_items + direct_additions
+            items = canonical_items + direct_additions
+            return self._filter_and_rank_knowledge(items)
 
         direct_items = knowledge.get("direct", [])
-        items = []
-        for item in direct_items:
-            if isinstance(item, dict):
-                items.append(item)
-        return items
+        return self._filter_and_rank_knowledge([
+            item for item in direct_items if isinstance(item, dict)
+        ])
+
+    def _filter_and_rank_knowledge(
+        self,
+        items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        filtered = [
+            item
+            for item in items
+            if knowledge_confidence_score(item) >= self.min_confidence
+        ]
+        return sorted(
+            filtered,
+            key=lambda item: (
+                -knowledge_confidence_score(item),
+                str(item.get("id") or ""),
+            ),
+        )
 
     def search_exact(
         self,
@@ -326,6 +358,12 @@ class GraphKnowledgeRetriever:
                         "knowledge": item,
                     })
 
+        results.sort(
+            key=lambda result: (
+                -knowledge_confidence_score(result["knowledge"]),
+                str(result["knowledge"].get("id") or ""),
+            )
+        )
         if max_items is not None:
             results = results[:max_items]
 
@@ -400,9 +438,16 @@ def format_knowledge_results(
         if len(content) > max_content_chars:
             content = content[:max_content_chars].rstrip() + "..."
         if knowledge_format == "content_only":
-            lines.append(f"{idx}. {content}")
+            lines.append(
+                f"{idx}. [Knowledge-ID: {item.get('id', '')}] "
+                f"[confidence={knowledge_confidence_score(item):.4f}] {content}"
+            )
             continue
         lines.append(f"{idx}. [{result['relation']}] {result['node_key']}")
+        lines.append(f"   Knowledge-ID: {item.get('id', '')}")
+        lines.append(
+            f"   Confidence: {knowledge_confidence_score(item):.4f}"
+        )
         if evidence.get("eval_passed") is False:
             pass_ratio = evidence.get("pass_ratio")
             pass_ratio_text = f", pass_ratio={pass_ratio}" if pass_ratio is not None else ""
@@ -422,6 +467,7 @@ def build_initial_caller_knowledge_context(
     graph_knowledge_path: str | Path,
     function_name: str,
     knowledge_format: str = "trigger_content",
+    min_confidence: float | None = None,
 ) -> str:
     """Build initial prompt context using only one-hop caller knowledge."""
 
@@ -429,7 +475,7 @@ def build_initial_caller_knowledge_context(
     if not path.exists():
         return ""
 
-    retriever = GraphKnowledgeRetriever(path)
+    retriever = GraphKnowledgeRetriever(path, min_confidence=min_confidence)
     search = retriever.search_exact(function_name, mode="callers", max_items=None)
     results = search["results"]
     if not results:

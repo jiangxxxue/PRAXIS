@@ -5,9 +5,16 @@ import tempfile
 from pathlib import Path
 
 from agent.sdk import run_sdk_agent
-from memory.config import code_dir, ensure_input_data, observed_knowledge_path
+from memory.config import (
+    code_dir,
+    ensure_input_data,
+    observed_knowledge_path,
+)
 from memory.observed_memory.build_dep_graph import build_dep_graph, save_dep_graph
-from memory.observed_memory.workspace import build_explore_workspace
+from memory.observed_memory.workspace import (
+    benchmark_target_locations,
+    build_explore_workspace,
+)
 
 def _extract_from_events(events, filename):
     """Fallback: extract file content from SDK events (file_editor writes)."""
@@ -29,16 +36,18 @@ def run_explore(
 ) -> Path:
     """Generate observed memory and dep graph for one example.
 
-    Returns path to written derived/observed_knowledge/{framework}/{example}.md.
+    Returns the run-scoped observed-knowledge output path.
     """
     if not ensure_input_data(framework, example):
         raise RuntimeError(f"Failed to generate input data for {example}")
 
-    # Build workspace with full code (no stubbing — agent explores the
-    # complete framework to document its public API and reuse patterns)
+    target_locations = benchmark_target_locations(framework, example)
+
+    # Benchmark targets stay present as signatures/docstrings, but their bodies
+    # are hidden before either the agent or graph builder can observe them.
     code_root = str(code_dir(framework, example))
     with tempfile.TemporaryDirectory() as tmp_dir:
-        paths = build_explore_workspace(code_root, {}, tmp_dir)
+        paths = build_explore_workspace(code_root, target_locations, tmp_dir)
 
         prompt = (
             Path(__file__).resolve().parent
@@ -68,14 +77,15 @@ def run_explore(
                     f"(status={status})"
                 )
 
-    # Save to derived/observed_knowledge/{framework}/{example}.md
+        graph = build_dep_graph(paths["code"], framework, example)
+
+    # Save to the run-scoped observed-knowledge directory.
     out = observed_knowledge_path(framework, example)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(content, encoding="utf-8")
     print(f"  Stage 1 done: {out}")
 
     # Build program dependency graph (pure AST, no LLM)
-    graph = build_dep_graph(code_root, framework, example)
     graph_path = save_dep_graph(graph, framework, example)
     stats = graph.get("_stats", {})
     print(f"  Dependency graph: {graph_path}")

@@ -7,12 +7,17 @@ when ``sqlite-vec`` is unavailable — equivalent for small corpora).
 """
 
 import os
+import sys
 import sqlite3
+import time
 
 from tools.knowledge_search.chunker import Chunk, chunk_file
 from tools.knowledge_search.hybrid import bm25_rank_to_score, build_fts_query
 
-EMBEDDING_MODEL = "text-embedding-3-small"
+DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
+EMBEDDING_STDERR_LOG_ENV = "EMBEDDING_STDERR_LOG"
+EMBEDDING_API_BASE_ENV = "EMBEDDING_API_BASE"
+EMBEDDING_API_KEY_ENV = "EMBEDDING_API_KEY"
 EMBED_BATCH_SIZE = 64
 MAX_FILE_SIZE = 512 * 1024  # 512 KB
 
@@ -57,6 +62,57 @@ BINARY_EXTENSIONS = {
 TEXT_BASENAMES = {"Dockerfile", "Makefile", "LICENSE", "NOTICE"}
 
 
+def _log_embedding_error(stage: str, **fields) -> None:
+    if os.environ.get(EMBEDDING_STDERR_LOG_ENV, "1").lower() in {"0", "false", "no", "off"}:
+        return
+
+    record = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "event": "embedding.error",
+        "stage": stage,
+        "model": os.environ.get("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
+    }
+    record.update({key: value for key, value in fields.items() if value is not None})
+    parts = [f"{key}={_format_log_value(value)}" for key, value in record.items()]
+    print("[EMBEDDING] " + " ".join(parts), file=sys.stderr, flush=True)
+
+
+def _format_log_value(value) -> str:
+    text = str(value).replace("\n", "\\n").replace("\r", "\\r")
+    if len(text) > 300:
+        text = text[:300] + "..."
+    if any(ch.isspace() for ch in text):
+        import json
+        return json.dumps(text, ensure_ascii=False)
+    return text or '""'
+
+
+def _embedding_api_key() -> str:
+    return (
+        os.environ.get(EMBEDDING_API_KEY_ENV, "").strip()
+        or os.environ.get("OPENROUTER_API_KEY", "").strip()
+        or os.environ.get("OPENAI_API_KEY", "").strip()
+    )
+
+
+def _embedding_api_base(api_key: str) -> str | None:
+    explicit = os.environ.get(EMBEDDING_API_BASE_ENV, "").strip()
+    if explicit:
+        return explicit
+    if api_key.startswith("sk-or-"):
+        return "https://openrouter.ai/api/v1"
+    return "https://api.openai.com/v1"
+
+
+def _embedding_model(api_base: str | None) -> str:
+    explicit = os.environ.get("EMBEDDING_MODEL", "").strip()
+    if explicit:
+        return explicit
+    if api_base and "openrouter.ai" in api_base:
+        return f"openrouter/{DEFAULT_EMBEDDING_MODEL}"
+    return DEFAULT_EMBEDDING_MODEL
+
+
 def cosine_similarity(a: list[float], b: list[float]) -> float:
     """Pure-Python cosine similarity (no numpy required)."""
     dot = sum(x * y for x, y in zip(a, b))
@@ -72,7 +128,6 @@ class SearchIndex:
         self.db: sqlite3.Connection | None = None
         self.chunks: dict[str, Chunk] = {}
         self.embeddings: dict[str, list[float]] = {}
-        self._embed_fn = None  # set during build if API key available
 
     def build(
         self,
@@ -175,13 +230,17 @@ class SearchIndex:
 
     def _build_embeddings(self, chunks: list[Chunk]) -> None:
         """Compute embeddings via litellm in batches."""
-        api_key = os.environ.get("OPENAI_API_KEY", "")
+        api_key = _embedding_api_key()
         if not api_key:
+            _log_embedding_error("build", reason="embedding API key not set", chunks=len(chunks))
             return
+        api_base = _embedding_api_base(api_key)
+        model = _embedding_model(api_base)
 
         try:
             import litellm
-        except ImportError:
+        except ImportError as exc:
+            _log_embedding_error("build", reason="litellm import failed", error=str(exc), chunks=len(chunks))
             return
 
         texts = [c.text for c in chunks]
@@ -192,25 +251,46 @@ class SearchIndex:
             batch_ids = ids[i:i + EMBED_BATCH_SIZE]
             try:
                 response = litellm.embedding(
-                    model=EMBEDDING_MODEL,
+                    model=model,
                     input=batch_texts,
                     api_key=api_key,
+                    api_base=api_base,
                 )
                 for j, item in enumerate(response.data):
                     self.embeddings[batch_ids[j]] = item["embedding"]
-            except Exception:
+            except Exception as exc:
                 # Embedding failure is non-fatal — fall back to BM25-only
+                _log_embedding_error(
+                    "build",
+                    batch_start=i,
+                    batch_size=len(batch_texts),
+                    chunks=len(chunks),
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
                 break
 
     def _embed(self, texts: list[str]) -> list[list[float]]:
         """Embed a list of texts using litellm."""
-        api_key = os.environ.get("OPENAI_API_KEY", "")
+        api_key = _embedding_api_key()
+        api_base = _embedding_api_base(api_key)
+        model = _embedding_model(api_base)
         import litellm
-        response = litellm.embedding(
-            model=EMBEDDING_MODEL,
-            input=texts,
-            api_key=api_key,
-        )
+        try:
+            response = litellm.embedding(
+                model=model,
+                input=texts,
+                api_key=api_key,
+                api_base=api_base,
+            )
+        except Exception as exc:
+            _log_embedding_error(
+                "query",
+                texts=len(texts),
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
         return [item["embedding"] for item in response.data]
 
     def search_keyword(

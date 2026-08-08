@@ -235,6 +235,50 @@ def _get_unreachable_lines(source_dir: str, source_file: str,
     return unreachable
 
 
+def _get_function_definition_lines(source_dir: str, source_file: str,
+                                   line_start: int, line_end: int) -> set[int]:
+    """Return target header lines executed only while importing the module."""
+    import ast
+
+    full_path = os.path.join(source_dir, source_file)
+    try:
+        with open(full_path, encoding="utf-8") as source:
+            tree = ast.parse(source.read())
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return set()
+
+    candidates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.lineno <= line_start <= getattr(node, "end_lineno", node.lineno)
+    ]
+    if not candidates:
+        return set()
+
+    target = min(
+        candidates,
+        key=lambda node: getattr(node, "end_lineno", node.lineno) - node.lineno,
+    )
+    body_lines = [
+        statement.lineno
+        for statement in target.body
+        if hasattr(statement, "lineno")
+    ]
+    if not body_lines:
+        return set()
+
+    header_start = min(
+        [target.lineno, *(decorator.lineno for decorator in target.decorator_list)]
+    )
+    body_start = min(body_lines)
+    return {
+        line
+        for line in range(header_start, body_start)
+        if line_start <= line <= line_end
+    }
+
+
 def _ensure_coverage():
     """Ensure coverage.py is available. Returns True on success."""
     try:
@@ -334,7 +378,10 @@ def serialize(obj):
     return {"__type__": type(obj).__name__, "repr": repr(obj)[:500]}
 
 
-def load_test_cases(test_input_file: str) -> tuple[dict, Optional[Callable], Optional[Callable]]:
+def load_test_cases(
+    test_input_file: str,
+    execution_root: str | None = None,
+) -> tuple[dict, Optional[Callable], Optional[Callable]]:
     """Load test cases and optional mock hooks from a test_input file.
 
     Returns:
@@ -342,13 +389,19 @@ def load_test_cases(test_input_file: str) -> tuple[dict, Optional[Callable], Opt
         setup_self_fn is None if no setup_self() is defined in the file.
         setup_env_fn is None if no setup_environment() is defined in the file.
     """
+    import types
     import unittest.mock
-    namespace = {
-        "__builtins__": __builtins__,
-        "MagicMock": unittest.mock.MagicMock,
-        "AsyncMock": unittest.mock.AsyncMock,
-        "mock": unittest.mock,
-    }
+
+    logical_root = execution_root or os.path.dirname(os.path.abspath(test_input_file))
+    logical_file = os.path.join(logical_root, os.path.basename(test_input_file))
+    module = types.ModuleType("__test_input__")
+    module.__file__ = os.path.abspath(logical_file)
+    module.__package__ = None
+    module.MagicMock = unittest.mock.MagicMock
+    module.AsyncMock = unittest.mock.AsyncMock
+    module.mock = unittest.mock
+    sys.modules[module.__name__] = module
+    namespace = module.__dict__
     with open(test_input_file, "r", encoding="utf-8") as f:
         code = compile(f.read(), test_input_file, "exec")
     exec(code, namespace)
@@ -356,6 +409,134 @@ def load_test_cases(test_input_file: str) -> tuple[dict, Optional[Callable], Opt
     setup_self_fn = namespace.get("setup_self", None)
     setup_env_fn = namespace.get("setup_environment", None)
     return test_cases, setup_self_fn, setup_env_fn
+
+
+def _tolerate_mock_modules_without_specs() -> None:
+    """Make package probes tolerate MagicMock modules inserted by test inputs."""
+    import importlib.util
+
+    current = importlib.util.find_spec
+    if getattr(current, "_praxis_tolerates_missing_mock_specs", False):
+        return
+
+    def _safe_find_spec(name, package=None):
+        try:
+            return current(name, package)
+        except ValueError as exc:
+            message = str(exc)
+            if (
+                name in sys.modules
+                and (
+                    f"{name}.__spec__ is not set" in message
+                    or f"{name}.__spec__ is None" in message
+                )
+            ):
+                return None
+            raise
+
+    _safe_find_spec._praxis_tolerates_missing_mock_specs = True
+    importlib.util.find_spec = _safe_find_spec
+
+
+def _repair_mock_package_metadata(modules_before_setup: dict) -> None:
+    """Keep mocked installed modules capable of resolving real dependencies."""
+    import importlib.machinery
+    import types
+
+    def _is_installed_spec(spec) -> bool:
+        paths = []
+        if getattr(spec, "origin", None):
+            paths.append(spec.origin)
+        if getattr(spec, "submodule_search_locations", None):
+            paths.extend(spec.submodule_search_locations)
+        return any(
+            "site-packages" in str(path) or "dist-packages" in str(path)
+            for path in paths
+        )
+
+    def _overlay_mock_attributes(real_module, mock_module) -> None:
+        import_metadata = {
+            "__builtins__",
+            "__cached__",
+            "__file__",
+            "__loader__",
+            "__name__",
+            "__package__",
+            "__path__",
+            "__spec__",
+        }
+        for attribute, value in vars(mock_module).items():
+            if attribute not in import_metadata:
+                setattr(real_module, attribute, value)
+
+    modules = sorted(
+        list(sys.modules.items()),
+        key=lambda item: item[0].count("."),
+    )
+    for name, module in modules:
+        if not isinstance(module, types.ModuleType):
+            continue
+        if getattr(module, "__spec__", None) is not None or getattr(
+            module, "__file__", None
+        ):
+            continue
+
+        previous = modules_before_setup.get(name)
+        if previous is module:
+            continue
+        previous_path = getattr(previous, "__path__", None)
+        previous_spec = getattr(previous, "__spec__", None)
+
+        parent_path = None
+        if "." in name:
+            parent_name = name.rsplit(".", 1)[0]
+            parent_path = getattr(sys.modules.get(parent_name), "__path__", None)
+            if not parent_path:
+                continue
+        try:
+            sys.modules.pop(name, None)
+            spec = importlib.machinery.PathFinder.find_spec(name, parent_path)
+        except (ImportError, AttributeError, ValueError):
+            spec = None
+        finally:
+            sys.modules[name] = module
+
+        real_module = None
+        if previous is not None and previous is not module and previous_spec is not None:
+            real_module = previous
+        elif spec is not None and _is_installed_spec(spec):
+            try:
+                sys.modules.pop(name, None)
+                real_module = importlib.import_module(name)
+            except (ImportError, AttributeError, ValueError):
+                real_module = None
+            finally:
+                sys.modules[name] = module
+
+        if real_module is not None:
+            _overlay_mock_attributes(real_module, module)
+            sys.modules[name] = real_module
+            if "." in name:
+                parent_name, child_name = name.rsplit(".", 1)
+                parent = sys.modules.get(parent_name)
+                if parent is not None:
+                    setattr(parent, child_name, real_module)
+            continue
+
+        if previous_path is not None:
+            module.__path__ = list(previous_path)
+            module.__spec__ = previous_spec
+            module.__loader__ = getattr(previous, "__loader__", None)
+            module.__package__ = getattr(previous, "__package__", name)
+        elif (
+            spec is not None
+            and spec.submodule_search_locations is not None
+            and not getattr(module, "__path__", None)
+        ):
+            module.__path__ = list(spec.submodule_search_locations)
+            module.__spec__ = spec
+            module.__loader__ = spec.loader
+            module.__package__ = name
 
 
 def _auto_mock_self(method, source_dir: str, source_file: str,
@@ -554,6 +735,101 @@ def _make_class_method_wrapper(method, setup_self_fn=None,
         return _wrapper
 
 
+def _nested_python_roots(source_dir: str, source_file: str) -> list[str]:
+    source_root = os.path.realpath(source_dir)
+    current = os.path.dirname(
+        os.path.realpath(os.path.join(source_dir, source_file))
+    )
+    roots = []
+    markers = ("pyproject.toml", "setup.py", "setup.cfg")
+
+    while current != source_root:
+        if not current.startswith(source_root + os.sep):
+            break
+        if any(os.path.isfile(os.path.join(current, marker)) for marker in markers):
+            roots.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+    return roots
+
+
+def _package_parent_roots(source_dir: str, source_file: str) -> list[str]:
+    source_root = os.path.realpath(source_dir)
+    current = os.path.dirname(
+        os.path.realpath(os.path.join(source_dir, source_file))
+    )
+    roots = []
+
+    while current != source_root:
+        if not current.startswith(source_root + os.sep):
+            break
+        if os.path.isfile(os.path.join(current, "__init__.py")):
+            roots.append(os.path.dirname(current))
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+
+    return roots
+
+
+def _prepare_import_paths(source_dir: str, source_file: str) -> None:
+    def add_first(path: str) -> None:
+        if os.path.isdir(path) and path not in sys.path:
+            sys.path.insert(0, path)
+
+    add_first(source_dir)
+    add_first(os.path.join(source_dir, "src"))
+
+    # Work from outer to inner so the closest project root wins.
+    for project_root in reversed(_nested_python_roots(source_dir, source_file)):
+        add_first(project_root)
+        add_first(os.path.join(project_root, "src"))
+
+    # Nested applications commonly import from an inner top-level package
+    # (for example backend/app/... uses "from app...").
+    for package_root in _package_parent_roots(source_dir, source_file):
+        add_first(package_root)
+
+    # Script-style modules often import local siblings without a package prefix.
+    add_first(os.path.dirname(os.path.join(source_dir, source_file)))
+
+
+def _force_namespace_ancestors(import_root: str, module_path: str) -> None:
+    """Retry a leaf import without executing eager ancestor initializers."""
+    import importlib.machinery
+    import types
+
+    parts = module_path.split(".")[:-1]
+    packages = []
+    for depth in range(1, len(parts) + 1):
+        package_name = ".".join(parts[:depth])
+        package_path = os.path.join(import_root, *parts[:depth])
+        if os.path.isdir(package_path):
+            packages.append((package_name, package_path))
+
+    package_names = [name for name, _path in packages]
+    for key in list(sys.modules):
+        if any(key == name or key.startswith(name + ".") for name in package_names):
+            del sys.modules[key]
+
+    for package_name, package_path in packages:
+        package = types.ModuleType(package_name)
+        package.__path__ = [package_path]
+        package.__package__ = package_name
+        package.__file__ = None
+        package.__spec__ = importlib.machinery.ModuleSpec(
+            package_name,
+            loader=None,
+            is_package=True,
+        )
+        package.__spec__.submodule_search_locations = [package_path]
+        sys.modules[package_name] = package
+
+
 def import_function(source_dir: str, source_file: str, function_name,
                      setup_self_fn=None, line_start: int = 0, line_end: int = 0):
     """Import a function. For class methods (ClassName.method), returns a wrapper.
@@ -561,10 +837,14 @@ def import_function(source_dir: str, source_file: str, function_name,
     If the name is unqualified (short), searches all classes in the module for the method.
     For class methods, auto-generates mock self from AST analysis if line range is provided.
     """
-    if source_dir not in sys.path:
-        sys.path.insert(0, source_dir)
+    _prepare_import_paths(source_dir, source_file)
+    src_root = os.path.join(source_dir, "src")
 
     module_path = source_file.replace("/", ".").replace("\\", ".").removesuffix(".py")
+    import_root = source_dir
+    if module_path.startswith("src.") and os.path.isdir(src_root):
+        module_path = module_path.removeprefix("src.")
+        import_root = src_root
 
     # Handle cases where a package directory exists alongside a same-named .py
     # file inside it (e.g. raganything/raganything.py alongside raganything/config.py).
@@ -573,15 +853,25 @@ def import_function(source_dir: str, source_file: str, function_name,
     # imports (from .sibling import X) work at every level.
     _top = module_path.split(".")[0]
     if _top != module_path:
-        _top_dir = os.path.join(source_dir, _top)
+        _top_dir = os.path.join(import_root, _top)
         if os.path.isdir(_top_dir):
             import types
             # Walk ALL intermediate package levels (e.g. src, src.agents, src.agents.ui_common)
             _parts = module_path.split(".")[:-1]  # All but the last (module) level
             for _depth in range(1, len(_parts) + 1):
                 _pkg_name = ".".join(_parts[:_depth])
-                _pkg_path = os.path.join(source_dir, *_parts[:_depth])
+                _pkg_path = os.path.join(import_root, *_parts[:_depth])
                 if not os.path.isdir(_pkg_path):
+                    continue
+                _init_file = os.path.join(_pkg_path, "__init__.py")
+                if os.path.isfile(_init_file):
+                    _existing = sys.modules.get(_pkg_name)
+                    _existing_file = os.path.realpath(getattr(_existing, "__file__", "") or "") if _existing else ""
+                    if _existing is not None and (
+                        not _existing_file
+                        or not _existing_file.startswith(os.path.realpath(_pkg_path) + os.sep)
+                    ):
+                        del sys.modules[_pkg_name]
                     continue
                 # Clear stale non-package modules
                 if _pkg_name in sys.modules and not hasattr(sys.modules[_pkg_name], '__path__'):
@@ -618,12 +908,38 @@ def import_function(source_dir: str, source_file: str, function_name,
     # This throws ImportError (not ModuleNotFoundError) at the top level, so we catch both.
     import re as _re
     _attempt = 0
+    _installed_packages = set()
+    _auto_install = os.environ.get(
+        "PRAXIS_COVERAGE_AUTO_INSTALL",
+        "",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    _package_aliases = {
+        "bs4": "beautifulsoup4",
+        "cv2": "opencv-python-headless",
+        "PIL": "Pillow",
+        "pillow_avif": "pillow-avif-plugin",
+        "pptx": "python-pptx",
+        "serpapi": "google-search-results",
+        "sklearn": "scikit-learn",
+        "speech_recognition": "SpeechRecognition",
+        "youtube_transcript_api": "youtube-transcript-api",
+    }
     while True:
         try:
             mod = __import__(module_path, fromlist=["_"])
             break
         except (ModuleNotFoundError, ImportError) as _exc:
             _msg = str(_exc)
+            if "partially initialized module" in _msg and _attempt == 0:
+                print(
+                    "    NOTE: circular package initializer detected; "
+                    "retrying with namespace ancestors"
+                )
+                _attempt += 1
+                _force_namespace_ancestors(import_root, module_path)
+                continue
+            if not _auto_install:
+                raise
             # Extract package name: try "pip install <pkg>" pattern first
             _m = _re.search(r"pip install\s+([\w\-\.\[\]]+)", _msg)
             if _m:
@@ -637,16 +953,27 @@ def import_function(source_dir: str, source_file: str, function_name,
             else:
                 raise  # don't try to auto-install if we can't identify the package
             _attempt += 1
-            if _attempt > 2:
+            if _attempt > 12:
                 raise
             # Skip sub-module dots (e.g. "app.core.config") — can't pip install those
             if "." in _pkg and not any(_pkg.startswith(p) for p in ("xai_",)):
                 raise
-            print(f"    NOTE: missing package '{_pkg}', installing...")
+            _distribution = _package_aliases.get(_pkg, _pkg)
+            if _distribution in _installed_packages:
+                raise
+            _installed_packages.add(_distribution)
+            print(
+                f"    NOTE: missing package '{_pkg}', "
+                f"installing '{_distribution}'..."
+            )
             try:
                 import subprocess as _sp
                 _sp.check_call([sys.executable, "-m", "pip", "install", "-q",
-                                "--no-warn-script-location", _pkg])
+                                "--no-warn-script-location", _distribution])
+                importlib.invalidate_caches()
+                for _key in list(sys.modules):
+                    if _key == _pkg or _key.startswith(_pkg + "."):
+                        del sys.modules[_key]
             except Exception:
                 raise _exc
     parts = function_name.split(".")
@@ -754,6 +1081,15 @@ def _to_mock(obj):
     return obj
 
 
+def _is_exception_type(value) -> bool:
+    """Return whether value is valid for isinstance(..., value)."""
+    if isinstance(value, type):
+        return issubclass(value, BaseException)
+    if isinstance(value, tuple) and value:
+        return all(_is_exception_type(item) for item in value)
+    return False
+
+
 def _run_one_case(func, case: dict, is_error: bool,
                    capture_output: bool = False) -> tuple[bool, dict]:
     """Run a single test case.
@@ -762,6 +1098,23 @@ def _run_one_case(func, case: dict, is_error: bool,
     """
     import asyncio
     import inspect as _inspect
+    expected_error = case.get("expected_error")
+    if is_error:
+        if "expected_error" not in case:
+            return False, {
+                "error_type": "MissingExpectedError",
+                "error": "error test cases must define expected_error as an exception class",
+            }
+        if not _is_exception_type(expected_error):
+            return False, {
+                "error_type": "InvalidExpectedError",
+                "error": (
+                    "expected_error must be an exception class or a non-empty tuple "
+                    f"of exception classes, got {expected_error!r}"
+                ),
+                "expected_error": str(expected_error),
+                "error_matched": False,
+            }
     try:
         mock_inputs = {k: _to_mock(v) for k, v in case["inputs"].items()}
         result = func(**mock_inputs)
@@ -783,17 +1136,18 @@ def _run_one_case(func, case: dict, is_error: bool,
             result = asyncio.run(_consume_agen(result))
             if not hasattr(_run_one_case, '_gen_logged'):
                 _run_one_case._gen_logged = True
-        if is_error and "expected_error" in case:
+        if is_error:
             return False, {"expected_error_not_raised": True}
         if capture_output:
             return True, {"output": serialize(result)}
         return True, {}
     except Exception as e:
         error_info = {"error_type": type(e).__name__, "error": str(e)[:500]}
-        if is_error and "expected_error" in case:
-            expected = case["expected_error"]
-            matched = isinstance(e, expected)
-            error_info["expected_error"] = getattr(expected, "__name__", str(expected))
+        if is_error:
+            matched = isinstance(e, expected_error)
+            error_info["expected_error"] = getattr(
+                expected_error, "__name__", str(expected_error),
+            )
             error_info["error_matched"] = matched
             return matched, error_info
         return False, error_info
@@ -841,6 +1195,9 @@ def _get_executable_lines(source_dir, source_file, line_start, line_end):
     """Get executable lines in range, excluding docstrings and unreachable code."""
     excluded = _get_docstring_lines(source_dir, source_file, line_start, line_end)
     excluded |= _get_unreachable_lines(source_dir, source_file, line_start, line_end)
+    excluded |= _get_function_definition_lines(
+        source_dir, source_file, line_start, line_end
+    )
 
     # Try coverage.py
     try:
@@ -1001,6 +1358,46 @@ def measure_aggregate(func, test_cases: dict, source_dir: str, source_file: str,
         "num_execution_errors": len(errors),
         "execution_errors": errors,
     }
+    normal_results = [
+        record for record in results
+        if record.get("category") == "normal"
+    ]
+    strong_results = [
+        record for record in results
+        if record.get("category") in {"normal", "edge"}
+    ]
+    strong_successes = sum(
+        1 for record in strong_results
+        if record.get("success")
+    )
+    strong_success_ratio = (
+        strong_successes / len(strong_results)
+        if strong_results
+        else 0.0
+    )
+    result["stage2_case_gate"] = {
+        "normal_cases": len(normal_results),
+        "normal_edge_cases": len(strong_results),
+        "normal_edge_successes": strong_successes,
+        "normal_edge_success_ratio": round(strong_success_ratio, 4),
+        "passed": (
+            len(normal_results) >= 5
+            and strong_success_ratio >= 0.8
+        ),
+    }
+    if not result["stage2_case_gate"]["passed"]:
+        result["is_execution_failure"] = True
+        result["execution_errors"].append({
+            "category": "stage2_case_gate",
+            "error": (
+                "Stage 2 requires at least 5 normal cases and an 80% "
+                "normal+edge success ratio; got "
+                f"{len(normal_results)} normal case(s) and "
+                f"{strong_successes}/{len(strong_results)} successful "
+                "normal+edge case(s)"
+            ),
+        })
+        result["num_execution_errors"] = len(result["execution_errors"])
     # Mark abstract stubs
     is_stub = _is_abstract_stub(source_dir, source_file, line_start, line_end)
     if is_stub:
@@ -1072,11 +1469,18 @@ def main():
     if not _ensure_coverage():
         print("    WARN: coverage.py not available, using dis fallback for executable lines")
 
-    test_cases, setup_self_fn, setup_env_fn = load_test_cases(args.test_input_file)
+    _prepare_import_paths(args.source_dir, args.source_file)
+    test_cases, setup_self_fn, setup_env_fn = load_test_cases(
+        args.test_input_file,
+        execution_root=os.path.dirname(os.path.abspath(args.source_dir)),
+    )
 
     if setup_env_fn is not None:
         print("    NOTE: calling setup_environment() from test_input")
+        _tolerate_mock_modules_without_specs()
+        modules_before_setup = dict(sys.modules)
         setup_env_fn()
+        _repair_mock_package_metadata(modules_before_setup)
 
     try:
         func = import_function(

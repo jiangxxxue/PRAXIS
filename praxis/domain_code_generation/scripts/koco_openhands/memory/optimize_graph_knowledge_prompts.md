@@ -49,25 +49,25 @@ User message 是一个 JSON object 的字符串：
 
 ## 2. 完整 Prompt: Propagation
 
-用途：判断一个 practice knowledge 是否应该沿一条 caller/callee 调用边，从 `current_node` 传播到 `target_node`。
+用途：判断一个高置信 practice knowledge 是否应该沿一条调用或数据依赖边，从 `current_node` 传播到 `target_node`。
 
 ```text
 ## Task Background
-- The input graph is a dependency graph of functions and methods. Nodes represent code entities, call edges represent caller/callee relationships, and practice-knowledge items are implementation rules mounted on graph nodes.
+- The input graph is a dependency graph of functions and methods. Nodes represent code entities, call edges represent caller/callee relationships, data edges connect consumers to producers, and practice-knowledge items are implementation rules mounted on graph nodes.
 
 ## Goal
-- Decide whether the practice-knowledge item should propagate across this one call-graph edge to target_node.
+- Decide whether the practice-knowledge item should propagate across this one dependency-graph edge to target_node.
 
 ## Input Fields
 - `knowledge`: the practice-knowledge item being evaluated, including id, trigger, content, evidence, and confidence.
 - `is_propagated_to_current_node`: true when this knowledge was propagated onto current_node from another node before this decision; false when this knowledge is current_node's direct knowledge.
 - `current_node`: the node currently expanding the propagation frontier, including source_code.
-- `target_node`: the candidate node reached by this one call edge, including source_code.
-- `edge`: direction and meaning for the candidate caller/callee relationship.
+- `target_node`: the candidate node reached by this one dependency edge, including source_code.
+- `edge`: kind, direction and meaning for the dependency relationship.
 
 ## Judgment Pipeline
 - Read the knowledge trigger/content/evidence and identify the concrete implementation rule it states.
-- Use current_node and target_node source code plus edge direction to decide whether target_node likely needs this rule.
+- Use current_node and target_node source code plus edge kind and direction to decide whether target_node likely needs this rule.
 - Use is_propagated_to_current_node only as provenance context; still judge the current edge on its own.
 - Propagate only when target_node's implementation likely needs the rule because it calls, is called by, wraps, delegates to, validates for, or consumes behavior from current_node.
 - Reject local implementation details that do not constrain target_node.
@@ -219,7 +219,7 @@ Schema 校验规则：
 }
 ```
 
-如果 duplicate cluster 只有一个 item，不调用 LLM，直接沿用该 item 的 `trigger/content`，并把来源 `evidence/confidence` 作为集合保留到 canonical knowledge。
+如果 duplicate cluster 只有一个 item，不调用 LLM，直接沿用该 item 的 `trigger/content`。Canonical knowledge 使用 noisy-or 聚合成单一 `confidence.score`，并在 `confidence_sources` 中保留来源明细。
 
 ## 5. 完整 Optimize 流程
 
@@ -240,9 +240,11 @@ optimize 阶段不会再次读取源码文件。
 
 当 `propagate=True` 时执行；命令行 `--no-propagate` 会跳过。
 
-1. 从 call edges 构造双向邻接表：
+1. 从 call/data edges 构造双向邻接表：
    - source -> target 记为 `direction=callee`
    - target -> source 记为 `direction=caller`
+   - data source -> target 记为 `direction=producer`
+   - data target -> source 记为 `direction=consumer`
 2. 对每个 origin node 上的每条 direct knowledge 启动 BFS frontier。
 3. 初始 queue item 是 `(origin_key, [origin_key], 0, False)`，其中最后一个 bool 表示 `is_propagated_to_current_node`。
 4. 对每条候选边调用 propagation prompt。Prompt 只包含当前待判断的 knowledge、`is_propagated_to_current_node`、current node、target node 和 edge direction；origin/path/hop 只保留在内部报告与 propagated item 元数据中。
@@ -255,7 +257,7 @@ optimize 阶段不会再次读取源码文件。
 }
 ```
 
-6. 只通过 `propagate=true/false` 判断是否传播，不使用 confidence。
+6. 调用 LLM 前先应用 `confidence.score >= min_confidence`，默认阈值为 `0.6`；低于阈值时记录 `status=skipped_low_confidence`。
 7. `propagate=false` 时，记录 `status=rejected_by_llm`。
 8. `propagate=true` 时：
    - 生成一条 `format=propagated_llm` 的 propagated knowledge item。
@@ -322,7 +324,7 @@ resolution_status=unresolved_invalid_keep
 resolution_status=removed_same_node_conflict
 ```
 
-conflict relation 不使用 confidence，也不再用 reason 文本做严格/非严格冲突二次判断。
+Conflict prompt 同时读取 evidence 和 confidence。若两个 conflict cluster 的聚合分差达到 `conflict_confidence_margin`（默认 `0.15`），系统确定性保留高分 cluster；否则沿用 LLM 的 `keep=a/b`。
 
 ### Step 4: Duplicate cluster merge
 
@@ -332,20 +334,20 @@ conflict relation 不使用 confidence，也不再用 reason 文本做严格/非
    - 不调用 merge prompt。
    - 用 cluster 第一个 item 的 trigger/content。
    - 写入 `status=removed_conflict`。
-   - 把来源 `evidence/confidence` 作为集合保留。
+   - 写入 noisy-or 聚合后的 `confidence.score`，并在 `confidence_sources` 保留来源。
    - 完整 canonical object 进入 node 的 `knowledge.removed`。
 2. 如果 cluster 只有一个 item：
    - 不调用 merge prompt。
    - 直接沿用该 item 的 trigger/content。
    - 写入 `status=active`。
-   - 把来源 `evidence/confidence` 作为集合保留。
+   - 写入单来源 confidence，并在 `confidence_sources` 保留来源。
    - 完整 canonical object 进入 node 的 `knowledge.canonical`。
 3. 如果 cluster 有多个 item：
    - 调用 duplicate cluster merge prompt。
    - 模型返回 `trigger/content`。
    - `trigger` 为空时回退到 cluster 第一个 item 的 trigger。
    - `content` 为空时回退到 cluster 第一个 item 的 content。
-   - 把来源 `evidence/confidence` 作为集合保留。
+   - 用 noisy-or 写入合并 confidence，并在 `confidence_sources` 保留来源。
    - 完整 canonical object 进入 node 的 `knowledge.canonical`。
 
 每个 cluster 的处理结果都会写入 `reports.merge_report`。

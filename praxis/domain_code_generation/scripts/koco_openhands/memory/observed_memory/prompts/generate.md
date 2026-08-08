@@ -81,6 +81,8 @@ Format rules:
 - `edge`: boundary conditions (all-zeros, zero beta, large beta, asymmetric masks, minimum shape, etc.)
 - `error`: inputs that should raise exceptions (shape mismatches, out-of-range values, wrong types)
 - Each `case()` call must pass ALL function parameters as keyword arguments, matching the function signature exactly
+- Do not pass helper state such as `scenario`, `mode`, or mock configuration through `case()`
+- For class methods with no parameters beyond `self`, configure per-case behavior through `setup_self(config=None)` or fixed mock state, not `case()` inputs
 - Add `note=` to document the purpose of each test case
 - `expected_error` should be the exception **class** (e.g., `RuntimeError`, `ValueError`), not a string
 
@@ -139,5 +141,7 @@ The test_input.py will be executed in a Docker environment. Only use:
 - Python standard library modules
 - Packages known to be installed in the evaluation image for this framework
 - NEVER import from local project modules that are not part of the installed package (e.g., `from bookworm.library import ...` will fail because bookworm is not a pip-installed package)
+- NEVER invent project-local imports such as `utils.model_wrapper`. If you need a local project module, first verify the exact path exists under `code/`; otherwise use mocks or stdlib helpers.
+- Avoid repository discovery code based on `__file__`, parent directory walks, or guessed relative paths. The coverage runner already imports the target function; your test input should define data, mocks, `setup_environment()`, and optional `setup_self()` only.
 
 Read the surrounding code to understand parameter types and expected behavior. Use `file_editor` to write both files.

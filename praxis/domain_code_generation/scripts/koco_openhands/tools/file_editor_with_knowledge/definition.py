@@ -42,9 +42,13 @@ class _FileEditorWithKnowledgeExecutor(ToolExecutor):
         inner,
         graph_knowledge_path: str | None = None,
         graph_knowledge_format: str = "trigger_content",
+        graph_knowledge_min_confidence: float | None = None,
     ):
         self._inner = inner
-        self.graph_retriever = make_graph_retriever(graph_knowledge_path)
+        self.graph_retriever = make_graph_retriever(
+            graph_knowledge_path,
+            min_confidence=graph_knowledge_min_confidence,
+        )
         self.graph_knowledge_format = graph_knowledge_format
         self._seen_node_keys: set[str] = set()
 
@@ -103,6 +107,7 @@ class FileEditorWithKnowledgeTool(FileEditorTool):
         conv_state: "ConversationState",
         graph_knowledge_path: str | None = None,
         graph_knowledge_format: str = "trigger_content",
+        graph_knowledge_min_confidence: float | None = None,
         **kwargs,
     ) -> Sequence["FileEditorWithKnowledgeTool"]:
         from openhands.tools.file_editor.impl import FileEditorExecutor
@@ -112,6 +117,7 @@ class FileEditorWithKnowledgeTool(FileEditorTool):
             inner,
             graph_knowledge_path=graph_knowledge_path,
             graph_knowledge_format=graph_knowledge_format,
+            graph_knowledge_min_confidence=graph_knowledge_min_confidence,
         )
 
         # Reuse the upstream description-construction logic.

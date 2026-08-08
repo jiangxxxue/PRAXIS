@@ -1,7 +1,7 @@
 """Program dependency graph builder — pure AST analysis, no LLM.
 
-Builds a graph of classes, functions, and methods with call/containment/
-inheritance edges.  Runs in ~50ms for typical project sizes.
+Builds a graph of classes, functions, and methods with call/data/containment/
+inheritance edges.
 
 Usage:
     from memory.observed_memory.build_dep_graph import build_dep_graph, save_dep_graph
@@ -169,6 +169,129 @@ def resolve_call_edges(
     return edges
 
 
+class _SharedStateVisitor(ast.NodeVisitor):
+    def __init__(self, enclosing_class: str | None):
+        self.enclosing_class = enclosing_class
+        self.reads: set[str] = set()
+        self.writes: set[str] = set()
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        symbol = self._attribute_symbol(node)
+        if symbol:
+            if isinstance(node.ctx, ast.Load):
+                self.reads.add(symbol)
+            elif isinstance(node.ctx, (ast.Store, ast.Del)):
+                self.writes.add(symbol)
+        self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for target in node.targets:
+            self._record_write_target(target)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is not None:
+            self.visit(node.value)
+        self._record_write_target(node.target)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        symbol = self._target_symbol(node.target)
+        if symbol:
+            self.reads.add(symbol)
+            self.writes.add(symbol)
+        self.visit(node.value)
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        for target in node.targets:
+            self._record_write_target(target)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+    def _attribute_symbol(self, node: ast.Attribute) -> str:
+        if (
+            self.enclosing_class
+            and isinstance(node.value, ast.Name)
+            and node.value.id in {"self", "cls"}
+        ):
+            return f"{self.enclosing_class}.{node.attr}"
+        return ""
+
+    def _record_write_target(self, target: ast.expr) -> None:
+        symbol = self._target_symbol(target)
+        if symbol:
+            self.writes.add(symbol)
+            if isinstance(target, ast.Subscript):
+                self.visit(target.slice)
+
+    def _target_symbol(self, target: ast.expr) -> str:
+        if isinstance(target, ast.Attribute):
+            return self._attribute_symbol(target)
+        if isinstance(target, ast.Subscript):
+            value = target.value
+            if isinstance(value, ast.Attribute):
+                return self._attribute_symbol(value)
+        return ""
+
+
+def collect_shared_state_accesses(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    enclosing_class: str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return stable shared-state symbols read and written by one callable."""
+
+    visitor = _SharedStateVisitor(enclosing_class)
+    for statement in function.body:
+        visitor.visit(statement)
+    return sorted(visitor.reads), sorted(visitor.writes)
+
+
+def add_data_dependency_edges(
+    nodes: list[dict],
+    edges: list[dict],
+) -> None:
+    """Add consumer-to-producer edges for shared state without direct calls."""
+
+    call_pairs = {
+        frozenset((str(edge.get("source")), str(edge.get("target"))))
+        for edge in edges
+        if edge.get("kind") == "call" and edge.get("source") and edge.get("target")
+    }
+    writers: dict[str, list[dict]] = {}
+    readers: dict[str, list[dict]] = {}
+    for node in nodes:
+        for symbol in node.get("data_writes") or []:
+            writers.setdefault(symbol, []).append(node)
+        for symbol in node.get("data_reads") or []:
+            readers.setdefault(symbol, []).append(node)
+
+    for symbol in sorted(set(writers) & set(readers)):
+        for consumer in readers[symbol]:
+            for producer in writers[symbol]:
+                consumer_id = str(consumer.get("id") or "")
+                producer_id = str(producer.get("id") or "")
+                if not consumer_id or not producer_id or consumer_id == producer_id:
+                    continue
+                if frozenset((consumer_id, producer_id)) in call_pairs:
+                    continue
+                edges.append({
+                    "source": consumer_id,
+                    "target": producer_id,
+                    "kind": "data",
+                    "data_symbols": [symbol],
+                    "lineno": consumer.get("lineno"),
+                })
+
+
 # ---------------------------------------------------------------------------
 # Graph builder
 # ---------------------------------------------------------------------------
@@ -217,7 +340,10 @@ def build_dep_graph(code_root: str, framework: str, example: str) -> dict:
     # ── Pass 2: resolve inheritance edge targets ──
     _resolve_inheritance_targets(edges, nodes)
 
-    # ── Pass 3: deduplicate edges ──
+    # ── Pass 3: add shared-state data dependencies ──
+    add_data_dependency_edges(nodes, edges)
+
+    # ── Pass 4: deduplicate edges ──
     edges = _dedup_edges(edges)
 
     # ── Stats ──
@@ -232,7 +358,7 @@ def build_dep_graph(code_root: str, framework: str, example: str) -> dict:
             "example": example,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "source_dir": str(code_path),
-            "graph_version": "1.0",
+            "graph_version": "1.1",
         },
         "nodes": nodes,
         "edges": edges,
@@ -240,6 +366,7 @@ def build_dep_graph(code_root: str, framework: str, example: str) -> dict:
             "num_nodes": len(nodes),
             "num_edges": len(edges),
             "call_edges": sum(1 for e in edges if e["kind"] == "call"),
+            "data_edges": sum(1 for e in edges if e["kind"] == "data"),
             "containment_edges": sum(1 for e in edges if e["kind"] == "contains"),
             "inheritance_edges": sum(1 for e in edges if e["kind"] == "inherits"),
             "skipped_calls": skipped_calls,
@@ -281,6 +408,10 @@ def _add_class_node(
             continue
         method_id = f"{class_id}.{stmt.name}"
         method_ids.append(method_id)
+        data_reads, data_writes = collect_shared_state_accesses(
+            stmt,
+            enclosing_class=class_id,
+        )
 
         method_node = {
             "id": method_id,
@@ -293,6 +424,8 @@ def _add_class_node(
             "end_lineno": stmt.end_lineno,
             "docstring": _get_docstring(stmt),
             "decorators": _decorator_names(stmt),
+            "data_reads": data_reads,
+            "data_writes": data_writes,
         }
         nodes.append(method_node)
 
@@ -386,9 +519,19 @@ def _dedup_edges(edges: list[dict]) -> list[dict]:
     unique = []
     for e in edges:
         key = (e["source"], e.get("target"), e["kind"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(e)
+        if key in seen:
+            if e["kind"] == "data":
+                existing = next(
+                    item
+                    for item in unique
+                    if (item["source"], item.get("target"), item["kind"]) == key
+                )
+                symbols = set(existing.get("data_symbols") or [])
+                symbols.update(e.get("data_symbols") or [])
+                existing["data_symbols"] = sorted(symbols)
+            continue
+        seen.add(key)
+        unique.append(e)
     return unique
 
 
@@ -397,7 +540,7 @@ def _dedup_edges(edges: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def save_dep_graph(graph: dict, framework: str, example: str) -> Path:
-    """Write dependency graph to derived/graph_knowledge/{framework}/{example}/dep_graph.json."""
+    """Write the dependency graph to the run-scoped graph directory."""
 
     out = dep_graph_path(framework, example)
     out.parent.mkdir(parents=True, exist_ok=True)

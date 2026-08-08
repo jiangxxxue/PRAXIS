@@ -42,9 +42,13 @@ def load_jsonl(path: str) -> list:
 def save_jsonl(data: list, path: str) -> None:
     """Save records to a JSONL file."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         for record in data:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
 
 
 # ---------------------------------------------------------------------------
@@ -65,8 +69,12 @@ def load_completed_ids(path: str) -> set:
 def save_completed_ids(ids: set, path: str) -> None:
     """Save set of completed function names to a progress file."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump({"completed_ids": sorted(ids)}, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +140,7 @@ def _stub_one_function(lines, start, end):
 
     node = target_node
     body = node.body
+    replacement_end = max(end, int(node.end_lineno or end))
 
     # Determine where the stub should start (after signature / docstring)
     has_docstring = (
@@ -154,23 +163,23 @@ def _stub_one_function(lines, start, end):
         stub_start = body[0].lineno  # 1-indexed
         indent = body[0].col_offset
 
-    # Build stub lines
+    # Build a line-count-preserving stub so graph locations and every function
+    # after the target retain their original source coordinates.
     indent_str = " " * indent
-    stub_lines = [
-        f"{indent_str}# TODO: implement this function\n",
-        f"{indent_str}raise NotImplementedError\n",
-    ]
-
-    # Replace lines after stub_start through end with stub_lines.
-    # When a docstring is present, stub_start is its end_lineno and we
-    # want to *keep* that line, so we slice [:stub_start].
-    # When there is no docstring, stub_start is body[0].lineno and we
-    # replace from that line onward, so we slice [:stub_start - 1].
     if has_docstring:
-        new_lines = lines[:stub_start] + stub_lines + lines[end:]
+        replace_start = stub_start
     else:
-        new_lines = lines[: stub_start - 1] + stub_lines + lines[end:]
-    return new_lines
+        replace_start = stub_start - 1
+    replace_count = max(1, replacement_end - replace_start)
+    if replace_count == 1:
+        stub_lines = [f"{indent_str}raise NotImplementedError\n"]
+    else:
+        stub_lines = [
+            f"{indent_str}# TODO: implement this function\n",
+            f"{indent_str}raise NotImplementedError\n",
+        ]
+        stub_lines.extend("\n" for _ in range(replace_count - 2))
+    return lines[:replace_start] + stub_lines + lines[replacement_end:]
 
 
 def _stub_one_function_regex(lines, start, end):
@@ -191,22 +200,27 @@ def _stub_one_function_regex(lines, start, end):
     body_indent = def_indent + 4
     indent_str = " " * body_indent
 
-    # Find body start: first non-blank, non-decorator, non-def-continuation line
-    body_start = def_idx + 1
-    # Skip continuation lines (lines that are part of multi-line signature)
-    while body_start < end and body_start < len(lines):
-        stripped = lines[body_start].strip()
-        if stripped and not stripped.startswith('#') and not stripped.startswith('@'):
+    signature_end = def_idx
+    paren_depth = 0
+    for index in range(def_idx, min(end, len(lines))):
+        line = lines[index]
+        paren_depth += line.count("(") + line.count("[") + line.count("{")
+        paren_depth -= line.count(")") + line.count("]") + line.count("}")
+        signature_end = index
+        if paren_depth <= 0 and line.rstrip().endswith(":"):
             break
-        body_start += 1
 
-    stub_lines = [
-        f"{indent_str}# TODO: implement this function\n",
-        f"{indent_str}raise NotImplementedError\n",
-    ]
-
-    new_lines = lines[:body_start] + stub_lines + lines[end:]
-    return new_lines
+    body_start = signature_end + 1
+    replace_count = max(1, end - body_start)
+    if replace_count == 1:
+        stub_lines = [f"{indent_str}raise NotImplementedError\n"]
+    else:
+        stub_lines = [
+            f"{indent_str}# TODO: implement this function\n",
+            f"{indent_str}raise NotImplementedError\n",
+        ]
+        stub_lines.extend("\n" for _ in range(replace_count - 2))
+    return lines[:body_start] + stub_lines + lines[end:]
 
 
 def _stub_gt_functions(code_dst, gt_locations):
@@ -291,9 +305,12 @@ def _parse_impl_location(impl_loc: str):
         return None, 0, 0
 
 
-_OBSERVED_KNOWLEDGE_ROOT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "memory", "derived", "observed_knowledge",
+from memory.config import MEMORY_RUN_ID, OBSERVED_KNOWLEDGE_DIR
+
+_OBSERVED_KNOWLEDGE_ROOT = str(
+    OBSERVED_KNOWLEDGE_DIR / MEMORY_RUN_ID
+    if MEMORY_RUN_ID
+    else OBSERVED_KNOWLEDGE_DIR
 )
 
 _GRAPH_KNOWLEDGE_ROOT = os.path.join(
@@ -329,6 +346,7 @@ def _default_graph_knowledge_path(
 def _build_initial_graph_knowledge_context(
     graph_knowledge_path: str,
     function_name: str,
+    min_confidence: float | None = None,
 ) -> str:
     """Build auto-injected one-hop caller knowledge context, if available."""
 
@@ -340,6 +358,7 @@ def _build_initial_graph_knowledge_context(
         return build_initial_caller_knowledge_context(
             graph_knowledge_path=graph_knowledge_path,
             function_name=function_name,
+            min_confidence=min_confidence,
         )
     except Exception as exc:
         print(f"    [{function_name}] Warning: graph knowledge context failed: {exc}")
@@ -459,20 +478,22 @@ def _extract_from_events(events, function_name: str) -> str:
     # Look for a file containing the target function
     for path, content in reversed(list(created_files.items())):
         if function_name in content:
+            leaf_name = function_name.rsplit(".", 1)[-1]
             pattern = _re.compile(
-                rf'^(def\s+{_re.escape(function_name)}\s*\(.*?\)\s*.*?:\s*\n)'
+                rf'^((?:async\s+)?def\s+{_re.escape(leaf_name)}\s*\(.*?\)\s*.*?:\s*\n)'
                 r'((?:(?:[ \t]+.+|[ \t]*#.+|[ \t]*)\n)*)',
                 _re.MULTILINE,
             )
             m = pattern.search(content)
             if m:
+                signature = m.group(1)
                 body = m.group(2)
                 lines = body.rstrip('\n').split('\n')
                 if lines:
                     indent = len(lines[0]) - len(lines[0].lstrip())
                     body = '\n'.join(l[indent:] for l in lines)
                 print(f"    [{function_name}] Fallback: extracted from SDK events ({os.path.basename(path)})")
-                return body
+                return signature + body
 
     return ""
 
@@ -524,6 +545,21 @@ def _sanitize_completion(code: str, function_name: str) -> str:
             break
 
     return code
+
+
+def _record_callable_name(record: dict) -> str:
+    """Return the source callable name, which may differ from the benchmark label."""
+
+    benchmark_name = str(record.get("function_name") or "")
+    signature = str(record.get("function_signature") or "")
+    match = re.search(r"\b(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(", signature)
+    if not match:
+        return benchmark_name
+
+    signature_name = match.group(1)
+    if benchmark_name.rsplit(".", 1)[-1] == signature_name:
+        return benchmark_name
+    return signature_name
 
 
 def _extract_function_from_file(file_path, function_name):
@@ -734,6 +770,16 @@ def _extract_knowledge_text(text: str) -> tuple[bool, str]:
     return False, ""
 
 
+_KNOWLEDGE_ID_RE = re.compile(r"Knowledge-ID:\s*([^\]\s]+)")
+
+
+def _normalize_knowledge_id(value) -> str:
+    knowledge_id = str(value or "").strip()
+    while knowledge_id.endswith(("\\n", "\\r", "\\t")):
+        knowledge_id = knowledge_id[:-2].rstrip()
+    return knowledge_id
+
+
 def _tool_trace_from_events(events) -> list[dict]:
     rows = []
     for idx, event in enumerate(events or []):
@@ -744,6 +790,11 @@ def _tool_trace_from_events(events) -> list[dict]:
         if not tool_name and not action and not observation_text:
             continue
         has_knowledge, knowledge_text = _extract_knowledge_text(observation_text)
+        knowledge_ids = sorted({
+            knowledge_id
+            for raw_id in _KNOWLEDGE_ID_RE.findall(observation_text)
+            if (knowledge_id := _normalize_knowledge_id(raw_id))
+        })
         rows.append({
             "event_index": idx,
             "tool_name": str(tool_name or ""),
@@ -754,6 +805,7 @@ def _tool_trace_from_events(events) -> list[dict]:
             "has_practice_knowledge": bool(has_knowledge and "practice" in knowledge_text.lower()),
             "has_observed_knowledge": bool(has_knowledge and "observed" in knowledge_text.lower()),
             "knowledge_text": knowledge_text,
+            "knowledge_ids": knowledge_ids,
             "is_error": "error" in observation_text.lower() or "traceback" in observation_text.lower(),
         })
     return rows
@@ -796,6 +848,7 @@ def run_single_instance(
     debug: bool = False,
     graph_knowledge_profile: str = "",
     graph_knowledge_artifact: str = "auto",
+    graph_knowledge_min_confidence: float | None = None,
     output_dir: str = "",
 ) -> dict:
     """Run the OpenHands SDK agent for one function.
@@ -829,15 +882,14 @@ def run_single_instance(
     conv_events = []
 
     try:
-        # --- Workspace isolation (stub only THIS function's GT, exclude test_code) ---
-        # Filter gt_locations to only the current record's GT location so
-        # other functions' implementations remain intact in the workspace.
+        # Hide every benchmark target before the agent explores the repository.
+        # This prevents cross-target answer leakage; signatures and docstrings
+        # remain available for structural reasoning.
         impl_loc = record.get("implementation_location", "")
         my_rel_path, my_start, my_end = _parse_impl_location(impl_loc)
-        if my_rel_path and my_start:
-            my_gt_locations = {my_rel_path: [(my_start, my_end)]}
-        else:
-            my_gt_locations = {}
+        from memory.observed_memory.workspace import benchmark_target_locations
+
+        my_gt_locations = benchmark_target_locations(framework, example)
         repo_paths = _prepare_workspace(
             workspace_root,
             knowledge_corpus_root,
@@ -872,6 +924,7 @@ def run_single_instance(
         graph_knowledge_context = _build_initial_graph_knowledge_context(
             graph_knowledge_path=graph_knowledge_path,
             function_name=function_name,
+            min_confidence=graph_knowledge_min_confidence,
         )
         if graph_knowledge_context:
             print(f"    [{function_name}] Injected graph caller knowledge into prompt")
@@ -900,18 +953,22 @@ def run_single_instance(
             api_key=api_key,
             base_url=base_url,
             max_iterations=max_iterations,
-            corpus_dirs=[repo_paths["knowledge_corpus"], repo_paths["code"]],
+            # Stage 4 target inference keeps knowledge_search disabled.
+            # Stage 1/2 practice agents still pass corpus_dirs explicitly.
+            corpus_dirs=None,
             graph_knowledge_path=graph_knowledge_path if graph_knowledge_enabled else None,
+            graph_knowledge_min_confidence=graph_knowledge_min_confidence,
         )
 
         print(f"    [{function_name}] SDK status: {conv_status.value}")
 
         # --- Extract result ---
         implementation = ""
+        callable_name = _record_callable_name(record)
 
         # Primary: extract the target function from the modified source file
         if stub_file and os.path.exists(stub_file):
-            implementation = _extract_function_from_file(stub_file, function_name)
+            implementation = _extract_function_from_file(stub_file, callable_name)
             if implementation:
                 print(f"    [{function_name}] Extracted from modified source file")
 
@@ -924,7 +981,7 @@ def run_single_instance(
 
         # Fallback 2: scan SDK conversation events for file_editor actions
         if not implementation:
-            implementation = _extract_from_events(conv_events, function_name)
+            implementation = _extract_from_events(conv_events, callable_name)
 
         # Sanitize: fix escaping, unwrap JSON/markdown
         implementation = _sanitize_completion(implementation, function_name)

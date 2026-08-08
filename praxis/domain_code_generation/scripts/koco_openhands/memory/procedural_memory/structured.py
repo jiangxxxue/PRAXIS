@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 
@@ -27,15 +28,7 @@ def distill_structured_trace(trace, *, model, api_key, base_url,
                              provider=None, api_version=None):
     """Distill one practice trace into structured JSONL memory entries."""
     spec = trace["spec"]
-    rel, _, _ = _parse_impl_location(spec["implementation_location"])
-    gt_source_file = (
-        PROJECT_ROOT / spec["framework"] / "test_examples"
-        / spec["example"] / "code" / rel
-    )
-    gt_source = _extract_function_from_file(
-        str(gt_source_file),
-        _spec_callable_name(spec),
-    )
+    gt_source = _ground_truth_source_for_spec(spec)
 
     system_msg = _structured_distill_system()
     user_msg = _build_structured_distill_user_message(trace, gt_source)
@@ -98,7 +91,8 @@ Return strict JSON only:
         "failed_iterations": [1]
       },
       "confidence": {
-        "score": 0.0
+        "score": 0.0,
+        "rationale": "Brief explanation of why this knowledge deserves this reliability score."
       }
     }
   ]
@@ -109,7 +103,34 @@ Rules:
 - Do not include Markdown fences or commentary.
 - trigger must be specific enough that a future agent can decide whether to apply the memory.
 - evidence must cite iter/case_idx labels or the GT design, not vague claims.
-- confidence.score must be in [0, 1]; use higher values when multiple practice attempts or a PASS strongly validate the lesson.
+- confidence.score is the final reliability estimate for this extracted knowledge
+  entry, not the practice pass rate and not confidence in your wording.
+- confidence.rationale must briefly identify the strongest supporting evidence
+  and the main remaining uncertainty behind the score.
+- The score controls how much a future system should trust and use the knowledge.
+  Knowledge below the downstream confidence threshold may be withheld entirely,
+  so score conservatively and do not inflate uncertain lessons.
+- Judge reliability from all of the following together:
+  1. factual correctness against the ground-truth implementation;
+  2. direct support from the cited attempts, case results, and key differences;
+  3. precision of the trigger about when the knowledge applies;
+  4. consistency across attempts, especially whether a successful implementation
+     validates the claimed lesson.
+- A PASS does not automatically make every inferred lesson reliable. A failed
+  attempt can support an anti-pattern only when the failure evidence clearly
+  establishes the connection. Generic advice, style preferences, speculation,
+  or claims that go beyond the GT and trace must receive low confidence or be
+  omitted.
+- Calibrate confidence.score in [0, 1]:
+  - 0.90-1.00: directly and unambiguously supported by GT and strong trace evidence;
+    safe to trust when the trigger matches.
+  - 0.75-0.89: reliable and well supported, with only minor uncertainty.
+  - 0.60-0.74: useful but supported by limited evidence or a somewhat broad trigger;
+    apply with caution.
+  - 0.40-0.59: materially uncertain, weakly supported, or difficult to generalize;
+    future use should be cautious and it may be filtered out.
+  - 0.00-0.39: unsupported, contradicted, speculative, or not meaningfully
+    transferable; normally omit the entry instead of emitting it.
 """
 
 
@@ -216,11 +237,7 @@ def _normalize_entry(entry, spec, idx):
     confidence_in = entry.get("confidence") if isinstance(entry.get("confidence"), dict) else {}
 
     passed, failed = _iteration_status_counts(spec)
-    score = confidence_in.get("score")
-    if not isinstance(score, (int, float)):
-        total = passed + failed
-        score = 0.5 if total == 0 else min(1.0, 0.4 + 0.6 * (passed / total))
-    score = max(0.0, min(1.0, float(score)))
+    score = _normalize_confidence_score(confidence_in.get("score"))
 
     normalized = {
         "id": _entry_id(
@@ -234,6 +251,8 @@ def _normalize_entry(entry, spec, idx):
         "framework": spec["framework"],
         "example": spec["example"],
         "source_function": spec["function_name"],
+        "callable_name": _spec_callable_name(spec),
+        "implementation_location": spec["implementation_location"],
         "trigger": trigger,
         "content": content,
         "evidence": {
@@ -246,7 +265,8 @@ def _normalize_entry(entry, spec, idx):
             "practice_attempts": passed + failed,
             "passes": passed,
             "failures": failed,
-            "score": round(score, 4),
+            "score": score,
+            "rationale": str(confidence_in.get("rationale", "")).strip(),
         },
     }
     if not normalized["evidence"]["passed_iterations"]:
@@ -258,6 +278,47 @@ def _normalize_entry(entry, spec, idx):
             trace_path_for_spec(spec)
         )
     return normalized
+
+
+def _normalize_confidence_score(value):
+    """Return a conservative unit score for model-produced confidence."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+    ):
+        return 0.0
+    return round(max(0.0, min(1.0, float(value))), 4)
+
+
+def _ground_truth_source_for_spec(spec):
+    location = str(spec.get("implementation_location") or "").strip()
+    rel, _, _ = _parse_impl_location(location)
+    if not rel:
+        raise ValueError(f"cannot parse implementation_location: {location!r}")
+
+    code_root = (
+        PROJECT_ROOT / spec["framework"] / "test_examples" / spec["example"] / "code"
+    ).resolve()
+    source_path = (code_root / rel).resolve()
+    try:
+        source_path.relative_to(code_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"implementation_location escapes the example code directory: {location!r}"
+        ) from exc
+
+    gt_source = _extract_function_from_file(
+        str(source_path),
+        _spec_callable_name(spec),
+    )
+    if not gt_source:
+        raise ValueError(
+            "cannot extract GT source for "
+            f"{spec.get('framework')}/{spec.get('example')}/"
+            f"{spec.get('function_name')}"
+        )
+    return gt_source
 
 
 def _repo_relative_str(path):

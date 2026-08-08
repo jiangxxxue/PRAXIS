@@ -156,10 +156,14 @@ class _TerminalWithKnowledgeExecutor(ToolExecutor):
 
     def __init__(self, inner, graph_knowledge_path: str | None = None,
                  working_dir: str | None = None,
-                 graph_knowledge_format: str = "trigger_content"):
+                 graph_knowledge_format: str = "trigger_content",
+                 graph_knowledge_min_confidence: float | None = None):
         self._inner = inner
         self._working_dir = working_dir
-        self.graph_retriever = make_graph_retriever(graph_knowledge_path)
+        self.graph_retriever = make_graph_retriever(
+            graph_knowledge_path,
+            min_confidence=graph_knowledge_min_confidence,
+        )
         self.graph_knowledge_format = graph_knowledge_format
         self._seen_node_keys: set[str] = set()
 
@@ -212,6 +216,7 @@ class TerminalWithKnowledgeTool(TerminalTool):
         executor: ToolExecutor | None = None,
         graph_knowledge_path: str | None = None,
         graph_knowledge_format: str = "trigger_content",
+        graph_knowledge_min_confidence: float | None = None,
         **kwargs,
     ) -> Sequence["TerminalWithKnowledgeTool"]:
         working_dir = conv_state.workspace.working_dir
@@ -236,6 +241,7 @@ class TerminalWithKnowledgeTool(TerminalTool):
             graph_knowledge_path=graph_knowledge_path,
             working_dir=working_dir,
             graph_knowledge_format=graph_knowledge_format,
+            graph_knowledge_min_confidence=graph_knowledge_min_confidence,
         )
 
         return [

@@ -18,13 +18,23 @@ from pathlib import Path
 
 from agent.sdk import _resolve_llm_model
 
+from memory.confidence import (
+    DEFAULT_ONLINE_FEEDBACK_BETA,
+    feedback_event_applied,
+    update_confidence_from_outcome,
+)
 from .config import (
     SCRIPTS_DIR,
     STRUCTURED_KNOWLEDGE_DIR,
     structured_knowledge_path,
     structured_per_function_dir,
 )
-from .structured import _dedupe_entries, _parse_json_payload, _write_jsonl
+from .structured import (
+    _dedupe_entries,
+    _normalize_confidence_score,
+    _parse_json_payload,
+    _write_jsonl,
+)
 
 PROVIDER_CHOICES = ("openai", "azure_openai", "openrouter")
 DEFAULT_PROFILE = "target"
@@ -39,6 +49,7 @@ MAX_OBSERVATION_CHARS = 4000
 MAX_KNOWLEDGE_CHARS = 1200
 TRACE_DETAIL_CHOICES = ("summary", "compact", "full")
 TARGET_TRACES_DIR = STRUCTURED_KNOWLEDGE_DIR / "_target_traces"
+KNOWLEDGE_ID_RE = re.compile(r"Knowledge-ID:\s*([^\]\s]+)")
 
 
 def cmd_import(args) -> None:
@@ -110,6 +121,11 @@ def cmd_import(args) -> None:
         f"imported={imported} skipped={skipped} "
         f"missing_result={missing_result} failed={failed}"
     )
+    if failed or missing_result or imported == 0:
+        raise RuntimeError(
+            "target-practice import incomplete: "
+            f"imported={imported} missing_result={missing_result} failed={failed}"
+        )
 
 
 def cmd_import_multi(args) -> None:
@@ -245,6 +261,11 @@ def cmd_distill(args) -> None:
         "target-practice distill: "
         f"wrote={wrote} skipped={skipped} not_passed={not_passed} failed={failed}"
     )
+    if failed or wrote == 0:
+        raise RuntimeError(
+            "target-practice distill produced no complete result: "
+            f"wrote={wrote} not_passed={not_passed} failed={failed}"
+        )
 
 
 def cmd_consolidate(args) -> None:
@@ -263,6 +284,45 @@ def cmd_consolidate(args) -> None:
         total += len(entries)
         print(f"[consolidated] {args.framework}/{example}: {len(entries)} -> {out_path}")
     print(f"target-practice consolidate: examples={len(examples)} entries={total}")
+
+
+def cmd_update_confidence(args) -> None:
+    graph_path = Path(args.graph_path)
+    if not graph_path.exists():
+        sys.exit(f"ERROR: graph knowledge artifact not found: {graph_path}")
+    traces = _select_trace_paths(
+        args.profile,
+        args.framework,
+        args.example,
+        args.function,
+    )
+    if not traces:
+        sys.exit("ERROR: no target traces found; run import first")
+
+    outcomes: list[tuple[set[str], bool, str]] = []
+    for trace_path in traces:
+        trace = json.loads(trace_path.read_text(encoding="utf-8"))
+        outcomes.extend(_trace_confidence_outcomes(
+            trace,
+            trace_key=str(trace_path),
+        ))
+
+    artifact = json.loads(graph_path.read_text(encoding="utf-8"))
+    updated = apply_online_confidence_feedback(
+        artifact,
+        outcomes,
+        beta=args.beta,
+    )
+    output_path = Path(args.output) if args.output else graph_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(artifact, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(
+        "target-practice update-confidence: "
+        f"traces={len(outcomes)} updated={updated} -> {output_path}"
+    )
 
 
 def build_target_trace(
@@ -310,6 +370,13 @@ def build_target_trace(
         "eval": eval_summary,
         "trajectory": {
             "task_prompt_path": _repo_relative(task_prompt_path) if task_prompt_path.exists() else "",
+            "injected_knowledge_ids": sorted(
+                set(
+                    KNOWLEDGE_ID_RE.findall(
+                        _read_text(task_prompt_path, 100000)
+                    )
+                )
+            ),
             "sdk_events_path": _repo_relative(sdk_events_path) if sdk_events_path.exists() else "",
             "tool_trace_path": _repo_relative(tool_trace_path) if tool_trace_path.exists() else "",
             "task_prompt_excerpt": _read_text(task_prompt_path, MAX_PROMPT_CHARS),
@@ -380,12 +447,13 @@ def distill_target_trace(trace: dict, *, model: str, api_key: str, base_url: str
         api_version=api_version,
         max_tokens=8192,
     )
-    return [
+    normalized = [
         _normalize_multi_attempt_entry(entry, trace, idx)
         if is_multi else _normalize_target_entry(entry, trace, idx)
         for idx, entry in enumerate(entries, 1)
         if _entry_has_signal(entry)
     ]
+    return normalized
 
 
 def summarize_tool_trace(rows: list[dict], trace_detail: str = "compact") -> dict:
@@ -476,7 +544,10 @@ Return strict JSON only:
         "key_observations": ["Specific signals from eval or trajectory."],
         "key_risk": "Main constraint, failure mode avoided, or validated behavior."
       },
-      "confidence": {"score": 0.0}
+      "confidence": {
+        "score": 0.0,
+        "rationale": "Brief explanation of why this knowledge deserves this reliability score."
+      }
     }
   ]
 }
@@ -488,7 +559,32 @@ Rules:
 - Reference actual APIs, files, commands, errors, branch conditions, tensor shapes, imports, or test signals when present.
 - If there is no useful signal, return {"entries":[]}.
 - Do not invent APIs, file contents, test cases, or ground truth.
-- confidence.score must be in [0, 1].
+- confidence.score is the final reliability estimate for this extracted knowledge
+  entry, not the target pass rate and not confidence in your wording.
+- confidence.rationale must briefly identify the strongest supporting evidence
+  and the main remaining uncertainty behind the score.
+- The score controls how much a future system should trust and use the knowledge.
+  Knowledge below the downstream confidence threshold may be withheld entirely,
+  so score conservatively and do not inflate uncertain lessons.
+- Judge reliability from all of the following together:
+  1. factual correctness against the final passed target implementation;
+  2. direct support from the task, final completion, trajectory, and evaluation result;
+  3. precision of the trigger about when the knowledge applies;
+  4. whether the observed pass validates the claimed implementation lesson.
+- A passed target trace does not automatically make every inferred lesson
+  reliable. Generic advice, style preferences, speculation, or claims that go
+  beyond the task, completion, and trace must receive low confidence or be
+  omitted.
+- Calibrate confidence.score in [0, 1]:
+  - 0.90-1.00: directly and unambiguously supported by the passed completion
+    and strong trajectory/evaluation evidence; safe to trust when the trigger matches.
+  - 0.75-0.89: reliable and well supported, with only minor uncertainty.
+  - 0.60-0.74: useful but supported by limited evidence or a somewhat broad trigger;
+    apply with caution.
+  - 0.40-0.59: materially uncertain, weakly supported, or difficult to generalize;
+    future use should be cautious and it may be filtered out.
+  - 0.00-0.39: unsupported, speculative, contradicted by the trace, or not
+    meaningfully transferable; normally omit the entry instead of emitting it.
 """
 
 
@@ -549,6 +645,15 @@ def _multi_attempt_distill_system() -> str:
 You distill multi-attempt target-function OpenHands traces into structured PracticeMemory.
 Only passed attempts should support positive implementation lessons.
 Return strict JSON with an entries list. Do not invent facts.
+
+For every emitted entry, include confidence.score and confidence.rationale.
+confidence.score is the final reliability estimate for the extracted knowledge,
+not the pass rate and not confidence in your wording. It controls downstream
+trust and filtering, so score conservatively. Use the same calibration:
+0.90-1.00 for directly and unambiguously supported lessons, 0.75-0.89 for
+reliable lessons with minor uncertainty, 0.60-0.74 for useful but limited
+evidence, 0.40-0.59 for materially uncertain lessons, and 0.00-0.39 for
+unsupported or speculative lessons that should normally be omitted.
 """
 
 
@@ -574,10 +679,7 @@ def _normalize_target_entry(entry: dict, trace: dict, idx: int) -> dict:
     confidence_in = entry.get("confidence") if isinstance(entry.get("confidence"), dict) else {}
     trigger = str(entry.get("trigger", "")).strip()
     content = str(entry.get("content", "")).strip()
-    score = confidence_in.get("score")
-    if not isinstance(score, (int, float)):
-        score = 0.8
-    score = max(0.0, min(1.0, float(score)))
+    score = _normalize_confidence_score(confidence_in.get("score"))
     profile = spec["profile"]
     function = spec["function_name"]
     trace_path = target_trace_path(profile, spec["framework"], spec["example"], function)
@@ -607,6 +709,7 @@ def _normalize_target_entry(entry: dict, trace: dict, idx: int) -> dict:
             "passes": 1,
             "failures": 0,
             "score": round(score, 4),
+            "rationale": str(confidence_in.get("rationale", "")).strip(),
         },
     }
 
@@ -897,7 +1000,149 @@ def _clip_tool_row(row: dict) -> dict:
 
 def _knowledge_hit(row: dict) -> dict:
     action = row.get("action") if isinstance(row.get("action"), dict) else {}
-    return {"tool_name": row.get("tool_name", ""), "action": _clip_text(json.dumps(action, ensure_ascii=False), 500), "knowledge_text": _clip_text(str(row.get("knowledge_text") or ""), MAX_KNOWLEDGE_CHARS)}
+    return {
+        "tool_name": row.get("tool_name", ""),
+        "action": _clip_text(json.dumps(action, ensure_ascii=False), 500),
+        "knowledge_text": _clip_text(
+            str(row.get("knowledge_text") or ""),
+            MAX_KNOWLEDGE_CHARS,
+        ),
+        "knowledge_ids": [
+            str(value)
+            for value in row.get("knowledge_ids") or []
+            if str(value)
+        ],
+    }
+
+
+def _trace_knowledge_ids(trace: dict) -> set[str]:
+    ids: set[str] = set()
+    if trace.get("kind") == "target_openhands_multi_attempt_trace":
+        payloads = trace.get("attempts") or []
+    else:
+        payloads = [trace]
+    for payload in payloads:
+        trajectory = payload.get("trajectory") or {}
+        ids.update(_normalized_knowledge_ids(
+            trajectory.get("injected_knowledge_ids") or []
+        ))
+        for hit in trajectory.get("graph_knowledge_hits") or []:
+            ids.update(_normalized_knowledge_ids(hit.get("knowledge_ids") or []))
+            text = str(hit.get("knowledge_text") or "")
+            ids.update(_normalized_knowledge_ids(KNOWLEDGE_ID_RE.findall(text)))
+        for step in trajectory.get("trajectory_steps") or []:
+            text = str(step.get("knowledge_excerpt") or "")
+            ids.update(_normalized_knowledge_ids(KNOWLEDGE_ID_RE.findall(text)))
+    return ids
+
+
+def _normalized_knowledge_ids(values) -> set[str]:
+    normalized = set()
+    for value in values:
+        knowledge_id = str(value or "").strip()
+        while knowledge_id.endswith(("\\n", "\\r", "\\t")):
+            knowledge_id = knowledge_id[:-2].rstrip()
+        if knowledge_id:
+            normalized.add(knowledge_id)
+    return normalized
+
+
+def _trace_confidence_outcomes(
+    trace: dict,
+    trace_key: str = "",
+) -> list[tuple[set[str], bool, str]]:
+    if trace.get("kind") == "target_openhands_multi_attempt_trace":
+        outcomes = []
+        for index, attempt in enumerate(trace.get("attempts") or []):
+            ids = _trace_knowledge_ids(attempt)
+            if ids:
+                outcomes.append((
+                    ids,
+                    attempt.get("eval", {}).get("passed") is True,
+                    _feedback_event_id(trace_key, attempt, index),
+                ))
+        return outcomes
+    ids = _trace_knowledge_ids(trace)
+    if not ids:
+        return []
+    return [(ids, _trace_passed(trace), _feedback_event_id(trace_key, trace))]
+
+
+def _feedback_event_id(
+    trace_key: str,
+    payload: dict,
+    attempt_index: int | None = None,
+) -> str:
+    event_payload = {
+        "trace_key": trace_key,
+        "attempt_index": attempt_index,
+        "source": payload.get("source"),
+        "infer": payload.get("infer"),
+        "eval": payload.get("eval"),
+        "completion": payload.get("completion"),
+        "knowledge_ids": sorted(_trace_knowledge_ids(payload)),
+    }
+    digest = hashlib.sha1(
+        json.dumps(
+            event_payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        ).encode()
+    ).hexdigest()[:16]
+    return f"feedback:{digest}"
+
+
+def apply_online_confidence_feedback(
+    artifact: dict,
+    outcomes: list[tuple[set[str], bool] | tuple[set[str], bool, str]],
+    *,
+    beta: float = DEFAULT_ONLINE_FEEDBACK_BETA,
+) -> int:
+    by_id: dict[str, list[dict]] = {}
+    for item in _iter_artifact_knowledge(artifact):
+        item_id = str(item.get("id") or "")
+        if item_id:
+            by_id.setdefault(item_id, []).append(item)
+
+    updated = 0
+    for outcome in outcomes:
+        knowledge_ids, succeeded = outcome[:2]
+        event_id = str(outcome[2]) if len(outcome) >= 3 else ""
+        for knowledge_id in knowledge_ids:
+            for item in by_id.get(knowledge_id, []):
+                if feedback_event_applied(item.get("confidence"), event_id):
+                    continue
+                item["confidence"] = update_confidence_from_outcome(
+                    item.get("confidence"),
+                    succeeded=succeeded,
+                    beta=beta,
+                    event_id=event_id,
+                )
+                updated += 1
+    return updated
+
+
+def _iter_artifact_knowledge(artifact: dict):
+    seen: set[int] = set()
+    for key in (
+        "knowledge_items",
+        "propagated_knowledge_items",
+        "canonical_knowledge_items",
+    ):
+        for item in artifact.get(key) or []:
+            if isinstance(item, dict) and id(item) not in seen:
+                seen.add(id(item))
+                yield item
+    for node in artifact.get("nodes") or []:
+        knowledge = node.get("knowledge") if isinstance(node, dict) else None
+        if not isinstance(knowledge, dict):
+            continue
+        for key in ("direct", "propagated", "canonical", "removed"):
+            for item in knowledge.get(key) or []:
+                if isinstance(item, dict) and id(item) not in seen:
+                    seen.add(id(item))
+                    yield item
 
 
 def _append_unique(items: list[str], value: str, limit: int) -> None:
@@ -1058,6 +1303,23 @@ def main() -> None:
     p_consolidate.add_argument("--framework", required=True)
     p_consolidate.add_argument("--example", default="")
     p_consolidate.set_defaults(func=cmd_consolidate)
+
+    p_update = sub.add_parser(
+        "update-confidence",
+        help="reinforce or decay injected graph knowledge from target outcomes",
+    )
+    _add_profile_arg(p_update)
+    p_update.add_argument("--framework", required=True)
+    p_update.add_argument("--example", default="")
+    p_update.add_argument("--function", default="")
+    p_update.add_argument("--graph-path", required=True)
+    p_update.add_argument("--output", default="")
+    p_update.add_argument(
+        "--beta",
+        type=float,
+        default=DEFAULT_ONLINE_FEEDBACK_BETA,
+    )
+    p_update.set_defaults(func=cmd_update_confidence)
 
     args = parser.parse_args()
     args.provider = args.provider or _infer_provider(args.base_url)

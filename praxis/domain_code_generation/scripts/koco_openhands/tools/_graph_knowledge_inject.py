@@ -14,14 +14,20 @@ DEFAULT_MAX_ITEMS_PER_NODE = 5
 DEFAULT_MAX_CONTENT_CHARS = 700
 
 
-def make_graph_retriever(graph_knowledge_path: str | None):
+def make_graph_retriever(
+    graph_knowledge_path: str | None,
+    min_confidence: float | None = None,
+):
     """Lazily build a ``GraphKnowledgeRetriever``; return None on failure/empty."""
     if not graph_knowledge_path:
         return None
     try:
         from memory.graph_knowledge_retriever import GraphKnowledgeRetriever
 
-        return GraphKnowledgeRetriever(graph_knowledge_path)
+        return GraphKnowledgeRetriever(
+            graph_knowledge_path,
+            min_confidence=min_confidence,
+        )
     except Exception:
         return None
 

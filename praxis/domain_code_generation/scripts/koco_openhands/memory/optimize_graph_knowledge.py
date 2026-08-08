@@ -29,6 +29,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from memory.confidence import (
+    DEFAULT_CONFLICT_CONFIDENCE_MARGIN,
+    aggregate_knowledge_confidence,
+    configured_confidence_threshold,
+    knowledge_confidence_score,
+)
 from memory.config import dep_graph_path
 
 
@@ -118,7 +124,13 @@ class LLMClient:
             self.cache = json.loads(self.cache_path.read_text(encoding="utf-8"))
 
     def complete_json(self, task: str, payload: dict[str, Any]) -> dict[str, Any]:
-        cache_key = _stable_id("LLM", task, json.dumps(payload, sort_keys=True, ensure_ascii=False))
+        cache_key = _stable_id(
+            "LLM",
+            self.model,
+            self.base_url,
+            task,
+            json.dumps(payload, sort_keys=True, ensure_ascii=False),
+        )
         if cache_key in self.cache:
             return self.cache[cache_key]
 
@@ -252,7 +264,13 @@ def source_value_records(cluster_items: list[dict[str, Any]], field: str) -> lis
 
 
 def forget_llm_cache_entry(llm: LLMClient, task: str, payload: dict[str, Any]) -> None:
-    cache_key = _stable_id("LLM", task, json.dumps(payload, sort_keys=True, ensure_ascii=False))
+    cache_key = _stable_id(
+        "LLM",
+        llm.model,
+        llm.base_url,
+        task,
+        json.dumps(payload, sort_keys=True, ensure_ascii=False),
+    )
     cache = getattr(llm, "cache", None)
     if not isinstance(cache, dict) or cache_key not in cache:
         return
@@ -311,20 +329,27 @@ def node_payload(node: dict[str, Any] | None) -> dict[str, Any]:
     return payload
 
 
-def build_bidirectional_call_neighbors(edges: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def build_bidirectional_dependency_neighbors(edges: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     neighbors: dict[str, list[dict[str, Any]]] = {}
     seen: set[tuple[str, str, str]] = set()
     for edge in edges:
-        if edge.get("kind") != "call":
+        edge_kind = edge.get("kind")
+        if edge_kind not in {"call", "data"}:
             continue
         source_keys = edge_endpoint_keys(edge, "source")
         target_keys = edge_endpoint_keys(edge, "target")
         for source_key in source_keys:
             for target_key in target_keys:
-                entries = (
-                    (source_key, target_key, "callee"),
-                    (target_key, source_key, "caller"),
-                )
+                if edge_kind == "call":
+                    entries = (
+                        (source_key, target_key, "callee"),
+                        (target_key, source_key, "caller"),
+                    )
+                else:
+                    entries = (
+                        (source_key, target_key, "producer"),
+                        (target_key, source_key, "consumer"),
+                    )
                 for current_key, neighbor_key, direction in entries:
                     dedup_key = (current_key, neighbor_key, direction)
                     if dedup_key in seen:
@@ -338,6 +363,9 @@ def build_bidirectional_call_neighbors(edges: list[dict[str, Any]]) -> dict[str,
     for node_neighbors in neighbors.values():
         node_neighbors.sort(key=lambda item: (item["node_key"], item["direction"]))
     return neighbors
+
+
+build_bidirectional_call_neighbors = build_bidirectional_dependency_neighbors
 
 
 def structured_task_prompt(
@@ -368,25 +396,26 @@ def propagation_prompt() -> str:
     common_background = (
         "The input graph is a dependency graph of functions and methods. Nodes "
         "represent code entities, call edges represent caller/callee relationships, "
+        "data edges connect consumers to producers, "
         "and practice-knowledge items are implementation rules mounted on graph nodes."
     )
     common_inputs = [
         "`knowledge`: the practice-knowledge item being evaluated, including id, trigger, content, evidence, and confidence.",
         "`is_propagated_to_current_node`: true when this knowledge was propagated onto current_node from another node before this decision; false when this knowledge is current_node's direct knowledge.",
         "`current_node`: the node currently expanding the propagation frontier, including source_code.",
-        "`target_node`: the candidate node reached by this one call edge, including source_code.",
-        "`edge`: direction and meaning for the candidate caller/callee relationship.",
+        "`target_node`: the candidate node reached by this one dependency edge, including source_code.",
+        "`edge`: kind, direction, and meaning for the candidate dependency relationship.",
     ]
     return structured_task_prompt(
         task_background=common_background,
         goal=(
             "Decide whether the practice-knowledge item should propagate across "
-            "this one call-graph edge to target_node."
+            "this one dependency-graph edge to target_node."
         ),
         input_fields=common_inputs,
         judgment_pipeline=[
             "Read the knowledge trigger/content/evidence and identify the concrete implementation rule it states.",
-            "Use current_node and target_node source code plus edge direction to decide whether target_node likely needs this rule.",
+            "Use current_node and target_node source code plus edge kind and direction to decide whether target_node likely needs this rule.",
             "Use is_propagated_to_current_node only as provenance context; still judge the current edge on its own.",
             "Propagate only when target_node's implementation likely needs the rule because it calls, is called by, wraps, delegates to, validates for, or consumes behavior from current_node.",
             "Reject local implementation details that do not constrain target_node.",
@@ -409,6 +438,7 @@ def knowledge_relation_prompt() -> str:
         "Use node source code to ground whether the rules apply to the same implementation condition.",
         "Choose `duplicate` only for surface paraphrases, restatements, or one item being a strict subset of the other when merging would not lose any concrete constraint.",
         "Choose `conflict` only when both rules cannot be true under the same relevant condition; if so, choose exactly one rule to keep: `a` or `b`.",
+        "For conflicts, compare evidence quality and confidence.score; prefer the better-grounded higher-confidence rule unless source code clearly supports the other rule.",
         "Choose `independent` when the items cover complementary rules, different scenarios, different inputs, or different implementation aspects.",
         "For duplicate or independent, set keep to null.",
         "Provide a concise reason.",
@@ -475,11 +505,20 @@ def judge_edge_propagation(
             "current_node": node_payload(current_node),
             "target_node": node_payload(target_node),
             "edge": {
+                "kind": (
+                    "data"
+                    if direction in {"producer", "consumer"}
+                    else "call"
+                ),
                 "direction": direction,
                 "meaning": (
                     "target is a callee/helper used by current"
                     if direction == "callee"
                     else "target is a caller/wrapper of current"
+                    if direction == "caller"
+                    else "target produces data consumed by current"
+                    if direction == "producer"
+                    else "target consumes data produced by current"
                 ),
             },
         },
@@ -513,9 +552,11 @@ def propagate_with_llm_edge_gating(
     max_hops: int = DEFAULT_PROPAGATION_MAX_HOPS,
     max_targets_per_knowledge: int = DEFAULT_PROPAGATION_MAX_TARGETS_PER_KNOWLEDGE,
     max_propagation_decisions: int | None = DEFAULT_MAX_PROPAGATION_DECISIONS,
+    min_confidence: float | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     nodes_by_key = {node["node_key"]: node for node in graph.get("nodes", []) if node.get("node_key")}
-    neighbors_by_node = build_bidirectional_call_neighbors(graph.get("edges", []))
+    neighbors_by_node = build_bidirectional_dependency_neighbors(graph.get("edges", []))
+    min_confidence = configured_confidence_threshold(min_confidence)
 
     propagated: list[dict[str, Any]] = []
     decisions: list[dict[str, Any]] = []
@@ -530,6 +571,16 @@ def propagate_with_llm_edge_gating(
         for item in direct_items:
             source_id = knowledge_id(item)
             if not source_id:
+                continue
+            item_confidence = knowledge_confidence_score(item)
+            if item_confidence < min_confidence:
+                decisions.append({
+                    "source_id": source_id,
+                    "origin_node": origin_key,
+                    "status": "skipped_low_confidence",
+                    "confidence": item_confidence,
+                    "min_confidence": min_confidence,
+                })
                 continue
             queue: list[tuple[str, list[str], int, bool]] = [(origin_key, [origin_key], 0, False)]
             queue_index = 0
@@ -667,7 +718,8 @@ def propagate_with_llm_edge_gating(
                         "origin_node": origin_key,
                         "from_node": current_key,
                         "to_node": target_key,
-                        "propagation_type": "llm_edge_gated_call",
+                        "propagation_type": "llm_edge_gated_dependency",
+                        "edge_kind": neighbor.get("edge", {}).get("kind"),
                         "direction": neighbor["direction"],
                         "hop_count": candidate_hop,
                         "path": candidate_path,
@@ -789,6 +841,7 @@ def deduplicate_by_node(
     graph: dict[str, Any],
     propagated_items: list[dict[str, Any]],
     llm: LLMClient,
+    conflict_confidence_margin: float = DEFAULT_CONFLICT_CONFIDENCE_MARGIN,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     raw_by_id = {
         item["id"]: item
@@ -871,6 +924,10 @@ def deduplicate_by_node(
         def canonical_id_for_root(root: str) -> str:
             return _stable_id("CK", node_key, *sorted(root_to_ids[root]))
 
+        def root_confidence(root: str) -> float:
+            cluster_items = [all_items[item_id] for item_id in root_to_ids[root]]
+            return float(aggregate_knowledge_confidence(cluster_items)["score"])
+
         for candidate in conflict_candidates:
             left_id = candidate["left_id"]
             right_id = candidate["right_id"]
@@ -889,7 +946,19 @@ def deduplicate_by_node(
                 "reason": candidate.get("reason", ""),
                 "retried": candidate.get("retried", False),
             }
-            keep_choice = str(candidate.get("keep") or "").strip().lower()
+            left_confidence = root_confidence(left_root)
+            right_confidence = root_confidence(right_root)
+            llm_keep = str(candidate.get("keep") or "").strip().lower()
+            keep_choice = llm_keep
+            confidence_override = False
+            if abs(left_confidence - right_confidence) >= conflict_confidence_margin:
+                keep_choice = "a" if left_confidence > right_confidence else "b"
+                confidence_override = keep_choice != llm_keep
+            conflict_record["left_confidence"] = left_confidence
+            conflict_record["right_confidence"] = right_confidence
+            conflict_record["llm_keep"] = llm_keep or None
+            conflict_record["confidence_margin"] = conflict_confidence_margin
+            conflict_record["confidence_override"] = confidence_override
             if keep_choice == "a":
                 kept_root, removed_root = left_root, right_root
             elif keep_choice == "b":
@@ -928,7 +997,8 @@ def deduplicate_by_node(
                 "trigger": merged["trigger"],
                 "content": merged["content"],
                 "evidence": source_value_records(cluster_items, "evidence"),
-                "confidence": source_value_records(cluster_items, "confidence"),
+                "confidence": aggregate_knowledge_confidence(cluster_items),
+                "confidence_sources": source_value_records(cluster_items, "confidence"),
                 "node_key": node_key,
                 "source_ids": sorted(cluster_ids),
                 "status": status,
@@ -955,6 +1025,8 @@ def build_optimized_graph(
     graph_path: str | Path,
     llm: LLMClient,
     max_propagation_decisions: int | None = DEFAULT_MAX_PROPAGATION_DECISIONS,
+    min_confidence: float | None = None,
+    conflict_confidence_margin: float = DEFAULT_CONFLICT_CONFIDENCE_MARGIN,
 ) -> dict[str, Any]:
     graph = json.loads(Path(graph_path).read_text(encoding="utf-8"))
 
@@ -962,24 +1034,28 @@ def build_optimized_graph(
         graph,
         llm,
         max_propagation_decisions=max_propagation_decisions,
+        min_confidence=min_confidence,
     )
     canonical_items, merge_report, relation_decisions, conflicts = deduplicate_by_node(
         graph=graph,
         propagated_items=propagated_items,
         llm=llm,
+        conflict_confidence_margin=conflict_confidence_margin,
     )
 
     active_canonical = [item for item in canonical_items if item.get("status") == "active"]
     implemented_steps = [
-        "llm_edge_gated_bidirectional_call_propagation",
-        "llm_pairwise_same_node_relation_with_llm_merge",
+        "confidence_gated_llm_bidirectional_dependency_propagation",
+        "confidence_aware_same_node_relation_with_noisy_or_merge",
     ]
     propagation_report_stats = propagation_stats(propagation_decisions)
     propagation_config = {
-        "mode": "llm_edge_gated_bidirectional_call",
+        "mode": "confidence_gated_llm_bidirectional_dependency",
         "max_hops": DEFAULT_PROPAGATION_MAX_HOPS,
         "max_targets_per_knowledge": DEFAULT_PROPAGATION_MAX_TARGETS_PER_KNOWLEDGE,
         "max_propagation_decisions": max_propagation_decisions,
+        "min_confidence": configured_confidence_threshold(min_confidence),
+        "conflict_confidence_margin": conflict_confidence_margin,
     }
     return {
         "$schema": SCHEMA,
@@ -1038,6 +1114,24 @@ def main() -> None:
             f"Defaults to {DEFAULT_MAX_PROPAGATION_DECISIONS}."
         ),
     )
+    parser.add_argument(
+        "--min-confidence",
+        type=float,
+        default=None,
+        help=(
+            "Do not propagate knowledge below this score. Defaults to "
+            "PRAXIS_CONFIDENCE_THRESHOLD or 0.6."
+        ),
+    )
+    parser.add_argument(
+        "--conflict-confidence-margin",
+        type=float,
+        default=DEFAULT_CONFLICT_CONFIDENCE_MARGIN,
+        help=(
+            "Keep the higher-confidence conflicting cluster when the score "
+            "difference reaches this margin."
+        ),
+    )
     args = parser.parse_args()
 
     if args.graph_path:
@@ -1062,6 +1156,8 @@ def main() -> None:
         graph_path=graph_file,
         llm=llm,
         max_propagation_decisions=args.max_propagation_decisions,
+        min_confidence=args.min_confidence,
+        conflict_confidence_margin=args.conflict_confidence_margin,
     )
 
     output.parent.mkdir(parents=True, exist_ok=True)

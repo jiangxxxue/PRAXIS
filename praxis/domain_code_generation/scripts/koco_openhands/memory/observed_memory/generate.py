@@ -5,23 +5,125 @@ import json
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 from agent.sdk import run_sdk_agent
 from memory.config import (
     code_dir,
     candidates_path,
+    generate_log_path,
+    generate_status_path,
     requirement_path,
     test_input_path,
     observed_knowledge_path,
 )
+from memory.observed_memory.status import (
+    fingerprint,
+    is_non_retryable_error,
+    is_transient_error,
+    reusable_terminal_status,
+    write_status,
+)
 from memory.observed_memory.validate_test_input import validate_test_input
-from memory.observed_memory.workspace import build_single_stub_workspace
+from memory.observed_memory.workspace import (
+    benchmark_target_locations,
+    build_single_stub_workspace,
+)
 from runner import _parse_impl_location
 
 # Max retries when test_input validation fails
 _MAX_VALIDATION_RETRIES = 2
+
+
+class GenerateResults(dict):
+    complete = False
+
+
+def _generate_budget(max_iterations: int, max_attempts: int) -> dict[str, int]:
+    return {
+        "max_iterations": max_iterations,
+        "max_attempts": max_attempts,
+    }
+
+
+def _generate_iteration_budgets(
+    max_iterations: int,
+    terminal_max_iterations: int,
+) -> list[int]:
+    terminal = max(max_iterations, terminal_max_iterations)
+    budgets = [max_iterations]
+    if max_iterations < terminal:
+        budgets.append(min(max(max_iterations, 160), terminal))
+    if budgets[-1] < terminal:
+        budgets.append(terminal)
+    return list(dict.fromkeys(budgets))
+
+
+def _read_attempt_log(path: Path) -> list[dict]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _write_attempt_log(path: Path, attempts: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(attempts, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _generation_retry_instructions(result: dict) -> str:
+    errors = result.get("validation_errors") or []
+    if errors:
+        details = "\n".join(f"- {error}" for error in errors)
+        return (
+            "\n\n## PREVIOUS ATTEMPT ERRORS (FIX THESE)\n\n"
+            f"{details}\n\n"
+            "Produce the requested test_input.py and fix every error above."
+        )
+    return (
+        "\n\n## PREVIOUS ATTEMPT DID NOT PRODUCE THE REQUIRED FILE\n\n"
+        "You must write a valid *_test_input.py file before finishing."
+    )
+
+
+def _generate_fingerprint(
+    candidate: dict,
+    framework: str,
+    example: str,
+    model: str,
+    base_url: str,
+) -> str:
+    rel_path, _start, _end = _parse_impl_location(
+        candidate["implementation_location"]
+    )
+    source_path = code_dir(framework, example) / rel_path
+    prompt_path = Path(__file__).resolve().parent / "prompts" / "generate.md"
+    static_memory_path = observed_knowledge_path(framework, example)
+    return fingerprint(
+        {
+            "stage": "generate",
+            "framework": framework,
+            "example": example,
+            "candidate": candidate,
+            "model": model,
+            "base_url": base_url,
+        },
+        [
+            source_path,
+            prompt_path,
+            static_memory_path,
+            Path(__file__),
+            Path(validate_test_input.__code__.co_filename),
+            Path(build_single_stub_workspace.__code__.co_filename),
+        ],
+    )
 
 
 def _suppress_verbose_logging():
@@ -80,7 +182,12 @@ def _run_agent_and_extract(
 
     try:
         paths = build_single_stub_workspace(
-            code_root, {}, rel_path, start, end, tmp_dir
+            code_root,
+            benchmark_target_locations(framework, example),
+            rel_path,
+            start,
+            end,
+            tmp_dir,
         )
 
         prompt_text = (
@@ -170,6 +277,8 @@ def _process_one_candidate(
     base_url: str,
     max_iterations: int,
     debug: bool = False,
+    max_validation_retries: int = _MAX_VALIDATION_RETRIES,
+    initial_extra_instructions: str = "",
 ) -> dict:
     """Run agent for a single candidate function with validation and retry.
 
@@ -185,8 +294,8 @@ def _process_one_candidate(
 
     code_root = str(code_dir(framework, example))
 
-    extra = ""
-    for attempt in range(1 + _MAX_VALIDATION_RETRIES):
+    extra = initial_extra_instructions
+    for attempt in range(1 + max_validation_retries):
         result = _run_agent_and_extract(
             func_name, impl_loc, rel_path, start, end, code_root,
             framework, example, model, api_key, base_url,
@@ -206,13 +315,24 @@ def _process_one_candidate(
 
         print(f"  [{func_name}] agent_status={result['status']}", flush=True)
 
-        # Validate test_input if we have one
-        if "test_input" in result and attempt < 1 + _MAX_VALIDATION_RETRIES:
+        # Validate every extracted test_input before it can be persisted.
+        if "test_input" in result:
             errors = validate_test_input(
-                result["test_input"], code_root, framework,
+                result["test_input"],
+                code_root,
+                framework,
+                implementation_location=impl_loc,
             )
             if not errors:
                 break  # Valid, done
+
+            if attempt >= max_validation_retries:
+                result.pop("test_input", None)
+                result["failure_reason"] = "validation retries exhausted"
+                result["validation_errors"] = errors
+                print(f"  [{func_name}] validation failed after final attempt", flush=True)
+                print("    Errors: " + "\n    ".join(errors))
+                break
 
             # Build retry instructions
             error_list = "\n".join(f"- {e}" for e in errors)
@@ -230,6 +350,7 @@ def _process_one_candidate(
             print(f"  [{func_name}] validation failed (attempt {attempt+1}), retrying...")
             print(f"    Errors: {error_list}")
         else:
+            result["failure_reason"] = "agent did not produce test_input"
             break
 
     return result
@@ -242,6 +363,7 @@ def run_generate(
     api_key: str,
     base_url: str = "https://openrouter.ai/api/v1",
     max_iterations: int = 100,
+    terminal_max_iterations: int | None = None,
     concurrency: int = 1,
     debug: bool = False,
     force: bool = False,
@@ -261,51 +383,227 @@ def run_generate(
 
     candidates = json.loads(cands_path.read_text(encoding="utf-8"))
 
-    # Skip candidates that already have test_input (unless --force)
-    if not force:
-        to_process = []
-        for c in candidates:
-            ti = test_input_path(framework, example, c["function_name"])
-            if ti.exists():
-                print(f"  SKIP {c['function_name']}: test_input already exists")
-            else:
-                to_process.append(c)
-        skipped = len(candidates) - len(to_process)
-        if skipped:
-            print(f"  Skipped {skipped} candidates with existing test_input")
-        candidates = to_process
-
     print(f"  Generating for {len(candidates)} candidates (concurrency={concurrency})")
     print(f"  max_iterations={max_iterations}, debug={debug}", flush=True)
 
-    results = {}
+    iteration_budgets = _generate_iteration_budgets(
+        max_iterations,
+        terminal_max_iterations or max_iterations,
+    )
+    terminal_budget = _generate_budget(
+        iteration_budgets[-1],
+        len(iteration_budgets),
+    )
+    print(f"  adaptive iteration budgets={iteration_budgets}", flush=True)
+    results = GenerateResults()
 
     def _worker(candidate):
-        return candidate["function_name"], _process_one_candidate(
-            candidate, framework, example, model, api_key, base_url,
-            max_iterations, debug=debug,
+        func_name = candidate["function_name"]
+        status_path = generate_status_path(framework, example, func_name)
+        log_path = generate_log_path(framework, example, func_name)
+        fingerprint_value = _generate_fingerprint(
+            candidate,
+            framework,
+            example,
+            model,
+            base_url,
         )
+        ti_path = test_input_path(framework, example, func_name)
+        existing_input_invalid = False
+
+        if not force and ti_path.is_file() and ti_path.stat().st_size > 0:
+            existing_errors = validate_test_input(
+                ti_path.read_text(encoding="utf-8"),
+                str(code_dir(framework, example)),
+                framework,
+                implementation_location=candidate["implementation_location"],
+            )
+            if not existing_errors:
+                status = write_status(
+                    status_path,
+                    status="success",
+                    fingerprint_value=fingerprint_value,
+                    budget=terminal_budget,
+                    model=model,
+                    reason="validated existing test_input",
+                    details={"adaptive_policy": "balanced-v1"},
+                )
+                print(
+                    f"  SKIP {func_name}: validated existing test_input",
+                    flush=True,
+                )
+                return func_name, {"_state": status}
+            existing_input_invalid = True
+            print(
+                f"  [{func_name}] existing test_input failed current "
+                "validation; regenerating",
+                flush=True,
+            )
+
+        if not force and not existing_input_invalid:
+            status = reusable_terminal_status(
+                status_path,
+                expected_fingerprint=fingerprint_value,
+                min_budget=terminal_budget,
+            )
+            if status:
+                if status["status"] == "success" and not (
+                    ti_path.is_file() and ti_path.stat().st_size > 0
+                ):
+                    status = None
+            if status:
+                print(
+                    f"  SKIP {func_name}: reusable generate status "
+                    f"{status['status']}",
+                    flush=True,
+                )
+                return func_name, {"_state": status}
+
+        rel_path, _start, _end = _parse_impl_location(
+            candidate["implementation_location"]
+        )
+        source_path = code_dir(framework, example) / rel_path
+        if not rel_path or not source_path.is_file():
+            status = write_status(
+                status_path,
+                status="unrunnable",
+                fingerprint_value=fingerprint_value,
+                budget=terminal_budget,
+                model=model,
+                reason=f"source file not found: {rel_path or '<unknown>'}",
+            )
+            return func_name, {"_state": status}
+
+        attempt_log = [] if force else _read_attempt_log(log_path)
+        extra_instructions = ""
+        result = {}
+        last_error = ""
+        latest_error_transient = False
+        non_retryable = False
+        run_attempts = 0
+
+        for attempt, attempt_budget in enumerate(iteration_budgets, 1):
+            run_attempts += 1
+            started = time.monotonic()
+            print(
+                f"  [{func_name}] adaptive attempt {attempt}/"
+                f"{len(iteration_budgets)}: max_iterations={attempt_budget}",
+                flush=True,
+            )
+            try:
+                result = _process_one_candidate(
+                    candidate,
+                    framework,
+                    example,
+                    model,
+                    api_key,
+                    base_url,
+                    attempt_budget,
+                    debug=debug,
+                    max_validation_retries=0,
+                    initial_extra_instructions=extra_instructions,
+                )
+                last_error = str(result.get("failure_reason") or "")
+                if not last_error and result.get("validation_errors"):
+                    last_error = "Validation errors: " + "; ".join(
+                        str(error) for error in result["validation_errors"]
+                    )
+            except Exception as exc:
+                result = {}
+                last_error = str(exc)
+
+            transient = is_transient_error(last_error)
+            non_retryable = is_non_retryable_error(last_error)
+            latest_error_transient = transient
+            attempt_log.append({
+                "attempt": len(attempt_log) + 1,
+                "stage_attempt": attempt,
+                "max_iterations": attempt_budget,
+                "duration_seconds": round(time.monotonic() - started, 3),
+                "has_requirement": "requirement" in result,
+                "has_test_input": "test_input" in result,
+                "validation_errors": result.get("validation_errors", []),
+                "error": last_error,
+                "transient": transient,
+                "timestamp": datetime.now().isoformat(),
+            })
+            _write_attempt_log(log_path, attempt_log)
+
+            if result.get("test_input"):
+                break
+            if non_retryable:
+                print(
+                    f"  [{func_name}] non-retryable request error; stopping",
+                    flush=True,
+                )
+                break
+            extra_instructions = _generation_retry_instructions(result)
+
+        if result.get("test_input"):
+            terminal_status = "success"
+        elif latest_error_transient and not non_retryable:
+            terminal_status = "retryable"
+        else:
+            terminal_status = "exhausted"
+        _save_result(framework, example, func_name, result)
+        fingerprint_value = _generate_fingerprint(
+            candidate,
+            framework,
+            example,
+            model,
+            base_url,
+        )
+        status = write_status(
+            status_path,
+            status=terminal_status,
+            fingerprint_value=fingerprint_value,
+            budget=terminal_budget,
+            model=model,
+            reason=last_error,
+            details={
+                "agent_status": str(result.get("status", "unknown")),
+                "has_requirement": "requirement" in result,
+                "has_test_input": "test_input" in result,
+                "validation_errors": result.get("validation_errors", []),
+                "adaptive_policy": "balanced-v1",
+                "attempts": len(attempt_log),
+                "latest_run_attempts": run_attempts,
+            },
+        )
+        result["_state"] = status
+        return func_name, result
 
     if concurrency <= 1:
         for i, candidate in enumerate(candidates, 1):
             print(f"\n--- [{i}/{len(candidates)}] {candidate['function_name']} ---", flush=True)
             func_name, result = _worker(candidate)
             results[func_name] = result
-            _save_result(framework, example, func_name, result)
     else:
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {pool.submit(_worker, c): c for c in candidates}
             for future in as_completed(futures):
                 func_name, result = future.result()
                 results[func_name] = result
-                _save_result(framework, example, func_name, result)
                 print(f"  [{func_name}] done", flush=True)
 
     # Summary
     ok = sum(1 for r in results.values() if "requirement" in r and "test_input" in r)
     partial = sum(1 for r in results.values() if "requirement" in r or "test_input" in r) - ok
     fail = len(results) - ok - partial
-    print(f"\n  Stage 3 done: {ok} complete, {partial} partial, {fail} failed", flush=True)
+    state_counts = {}
+    for result in results.values():
+        state = result.get("_state", {}).get("status", "unknown")
+        state_counts[state] = state_counts.get(state, 0) + 1
+    results.complete = bool(results) and all(
+        result.get("_state", {}).get("status")
+        in {"success", "exhausted", "unrunnable"}
+        for result in results.values()
+    )
+    print(
+        f"\n  Stage 3 done: {ok} complete, {partial} partial, {fail} failed; "
+        f"states={state_counts}",
+        flush=True,
+    )
     return results
 
 
